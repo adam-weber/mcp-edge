@@ -34,11 +34,11 @@ The runtime handles MCP protocol details, tool discovery, and message routing.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Your device                                             │
-│                                                          │
+│  Your device                                            │
+│                                                         │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │  mcp-edge runtime                                   │ │
-│  │                                                     │ │
+│  │  mcp-edge runtime                                  │ │
+│  │                                                    │ │
 │  │  ┌─────────────┐  ┌─────────────┐                  │ │
 │  │  │ Provider A  │  │ Provider B  │  (your code)     │ │
 │  │  │ (sensors)   │  │ (actuators) │                  │ │
@@ -46,14 +46,14 @@ The runtime handles MCP protocol details, tool discovery, and message routing.
 │  │         │                │                         │ │
 │  │         └───────┬────────┘                         │ │
 │  │                 │                                  │ │
-│  │         ┌───────▼────────┐                        │ │
-│  │         │   Transport    │  (how agents connect)  │ │
-│  │         │  (TCP, MQTT,   │                        │ │
-│  │         │   Unix, etc)   │                        │ │
-│  │         └───────┬────────┘                        │ │
-│  └─────────────────│────────────────────────────────┘ │
-│                    │                                   │
-└────────────────────│───────────────────────────────────┘
+│  │         ┌───────▼────────┐                         │ │
+│  │         │   Transport    │  (how agents connect)   │ │
+│  │         │  (TCP, MQTT,   │                         │ │
+│  │         │   Unix, etc)   │                         │ │
+│  │         └───────┬────────┘                         │ │
+│  └─────────────────│──────────────────────────────────┘ │
+│                    │                                    │
+└────────────────────│────────────────────────────────────┘
                      │
                      ▼
                   Agent
