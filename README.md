@@ -2,25 +2,70 @@
 
 A minimal MCP runtime for resource-constrained devices.
 
-## Why Not Just Use Existing MCP SDKs?
+## Getting Started
 
-The official MCP SDKs assume desktop-class resources: gigabytes of RAM, fast CPUs, reliable network, Node.js or Python runtimes.
+### Install
 
-Edge devices don't have that. A Raspberry Pi Zero has 512MB. A zonal controller in a car might budget 16MB for your service. An industrial sensor runs on milliwatts.
+```bash
+cargo add mcp-edge
+```
 
-These constraints don't mean "no MCP." They mean "MCP, designed differently."
+### Minimal Example
 
-**mcp-edge is MCP for devices where resources are precious.**
+```rust
+use mcp_edge::{Runtime, Provider, Tool, ToolResult, UnixTransport};
+use std::collections::HashMap;
 
-## Who Is This For
+// Define a provider for your hardware
+struct TemperatureSensor;
 
-**Device makers** who want their hardware to be AI-accessible without building custom integrations for every agent/assistant.
+impl Provider for TemperatureSensor {
+    fn name(&self) -> &str { 
+        "temperature" 
+    }
 
-**System integrators** who connect AI to physical infrastructure (buildings, factories, fleets) and want a standard protocol instead of point-to-point integrations.
+    fn tools(&self) -> Vec {
+        vec![Tool {
+            name: "read_temperature".into(),
+            description: "Read temperature in Celsius".into(),
+        }]
+    }
 
-**Agent developers** who want to interact with the physical world without reverse-engineering every device's proprietary API.
+    fn call(&self, tool: &str, _params: &HashMap) -> ToolResult {
+        match tool {
+            "read_temperature" => {
+                // Your actual sensor reading logic here
+                let temp = 22.5; 
+                ToolResult::Ok(format!("{:.1}", temp))
+            }
+            _ => ToolResult::Err("unknown tool".into())
+        }
+    }
+}
 
-**Hobbyists** who want to say "Hey Claude, what's the temperature in my greenhouse?" and have it actually work.
+fn main() {
+    let mut runtime = Runtime::new();
+    runtime.register(TemperatureSensor);
+    runtime.serve(UnixTransport::new("/tmp/mcp-edge.sock"));
+}
+```
+
+### Test It
+
+```bash
+# Terminal 1: Run the server
+cargo run
+
+# Terminal 2: Send MCP messages
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | nc -U /tmp/mcp-edge.sock
+# Returns: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_temperature",...}]}}
+
+echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_temperature"}}' | nc -U /tmp/mcp-edge.sock
+# Returns: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"22.5"}]}}
+```
+
+Any MCP-compatible agent can now discover and use your sensor.
+
 
 ## How It Works
 
