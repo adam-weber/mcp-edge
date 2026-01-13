@@ -2,16 +2,6 @@
 
 A minimal MCP runtime for resource-constrained devices.
 
-## Why This Exists
-
-AI agents are getting good at reasoning and taking action. But they live in the cloud, disconnected from the physical world.
-
-Meanwhile, the physical world is full of devices: sensors, machines, vehicles, that have no voice in AI conversations.
-
-**MCP (Model Context Protocol)** solved this problem for desktop software. It gives AI agents a standard way to discover and use tools. An agent doesn't need custom code to work with your app—it just speaks MCP.
-
-**mcp-edge** brings MCP to the physical world on resource constrained devices.
-
 ## Why Not Just Use Existing MCP SDKs?
 
 The official MCP SDKs assume desktop-class resources: gigabytes of RAM, fast CPUs, reliable network, Node.js or Python runtimes.
