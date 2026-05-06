@@ -27,5 +27,9 @@ name = "sensor"
 required-features = ["std"]
 
 [[example]]
+name = "stdio"
+required-features = ["std"]
+
+[[example]]
 name = "gateway"
 required-features = ["gateway"]

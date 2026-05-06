@@ -38,11 +38,14 @@ fn main() {
 }
 ```
 
-That's the whole program. Cross-machine? Swap one line:
+That's the whole program. Different transport, swap one line — same handler closure:
 
 ```rust
-TcpTransport::new("0.0.0.0:9000").serve(|m, o| rt.handle(m, o));
+TcpTransport::new("0.0.0.0:9000").serve(|m, o| rt.handle(m, o));     // cross-machine
+StdioTransport::serve(|m, o| rt.handle(m, o));                       // subprocess MCP server
 ```
+
+Runnable scenarios — including how to register the stdio binary with an MCP host — are in [`examples/`](examples/).
 
 ## Try it
 

@@ -509,7 +509,16 @@ pub mod transport {
                         let msg_end = msg_start + rel;
                         if msg_end > msg_start {
                             let n = handler(&rx[msg_start..msg_end], &mut tx);
-                            if conn.write_all(&tx[..n]).is_err() { break 'conn; }
+                            if n > 0 {
+                                if conn.write_all(&tx[..n]).is_err() { break 'conn; }
+                                // Flush is a no-op on socket streams but
+                                // required for buffered streams like stdout:
+                                // when this process is spawned with a pipe
+                                // (the typical subprocess-MCP-server setup),
+                                // stdout is fully-buffered by default and
+                                // unflushed responses sit invisible.
+                                if conn.flush().is_err() { break 'conn; }
+                            }
                         }
                         msg_start = msg_end + 1;
                     }
@@ -576,6 +585,49 @@ pub mod transport {
             for conn in listener.incoming().flatten() {
                 run_connection(conn, &handler);
             }
+        }
+    }
+
+    /// Stdio transport. Reads JSON-RPC requests from stdin, writes responses
+    /// to stdout — the canonical shape for MCP servers that a host spawns
+    /// as a subprocess (the most common local-server pattern).
+    ///
+    /// ```ignore
+    /// use mcp_edge::transport::StdioTransport;
+    /// StdioTransport::serve(|m, o| rt.handle(m, o));
+    /// ```
+    ///
+    /// See `examples/README.md` for host-side registration steps.
+    pub struct StdioTransport;
+
+    impl StdioTransport {
+        pub fn serve(handler: impl Fn(&[u8], &mut [u8]) -> usize) {
+            // Wrap stdin+stdout into a single Read+Write so the same
+            // `run_connection` framing loop drives stdio identically to
+            // sockets. Buffered stdout is the reason `run_connection` flushes
+            // after each response (see comment there).
+            struct StdioStream {
+                stdin: std::io::Stdin,
+                stdout: std::io::Stdout,
+            }
+            impl Read for StdioStream {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    self.stdin.read(buf)
+                }
+            }
+            impl Write for StdioStream {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.stdout.write(buf)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.stdout.flush()
+                }
+            }
+            let stream = StdioStream {
+                stdin: std::io::stdin(),
+                stdout: std::io::stdout(),
+            };
+            run_connection(stream, &handler);
         }
     }
 }
