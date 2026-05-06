@@ -360,24 +360,29 @@ impl<'a> Writer<'a> {
     }
 
     pub(crate) fn esc(&mut self, s: &str) -> &mut Self {
-        for b in s.bytes() {
-            // Map special chars to their escape suffix; plain chars go direct.
-            let second: u8 = match b {
+        // Bulk-copy runs of plain bytes between escape chars. `iter().position`
+        // with a constant set of needles is loop-friendly (LLVM often
+        // auto-vectorizes on x86/NEON), and `push` lowers to one memcpy per
+        // run — far cheaper than the original byte-at-a-time write loop for
+        // typical descriptions and tool-result text.
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let rel = bytes[i..]
+                .iter()
+                .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t'));
+            let end = rel.map(|r| i + r).unwrap_or(bytes.len());
+            if end > i { self.push(&bytes[i..end]); }
+            let Some(r) = rel else { break };
+            let second = match bytes[i + r] {
                 b'"'  => b'"',
                 b'\\' => b'\\',
                 b'\n' => b'n',
                 b'\r' => b'r',
                 b'\t' => b't',
-                _ => {
-                    if self.pos < self.buf.len() {
-                        self.buf[self.pos] = b;
-                        self.pos += 1;
-                    }
-                    continue;
-                }
+                _ => unreachable!(),
             };
-            // Write backslash + escape char directly — avoids copy_from_slice overhead.
-            if self.pos + 1 < self.buf.len() {
+            if self.pos + 2 <= self.buf.len() {
                 self.buf[self.pos]     = b'\\';
                 self.buf[self.pos + 1] = second;
                 self.pos += 2;
@@ -385,6 +390,7 @@ impl<'a> Writer<'a> {
                 self.buf[self.pos] = b'\\';
                 self.pos += 1;
             }
+            i = end + 1;
         }
         self
     }
@@ -601,6 +607,29 @@ mod tests {
         assert_eq!(inner, br#""value""#);
         let data = obj_get(json, b"key").unwrap();
         assert_eq!(data, br#""data""#);
+    }
+
+    #[test]
+    fn test_esc() {
+        // Exercises Writer::esc directly: plain runs, leading/trailing escapes,
+        // adjacent escapes, and an empty string.
+        fn run(input: &str) -> String {
+            let mut buf = [0u8; 256];
+            let pos = {
+                let mut w = Writer::new(&mut buf);
+                w.esc(input);
+                w.pos
+            };
+            core::str::from_utf8(&buf[..pos]).unwrap().to_string()
+        }
+        assert_eq!(run(""), "");
+        assert_eq!(run("plain text"), "plain text");
+        assert_eq!(run("a\nb"), "a\\nb");
+        assert_eq!(run("\"quoted\""), "\\\"quoted\\\"");
+        assert_eq!(run("\n\t"), "\\n\\t");
+        assert_eq!(run("a\\b"), "a\\\\b");
+        assert_eq!(run("end\n"), "end\\n");
+        assert_eq!(run("\rstart"), "\\rstart");
     }
 
     #[test]
