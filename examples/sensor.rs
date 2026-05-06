@@ -1,7 +1,13 @@
-//! Example: two mock sensors exposed over a Unix socket.
+//! Example: mock sensors exposed over a Unix socket.
 //!
-//! Run:  cargo run --example sensor
-//! Test: echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | nc -U /tmp/mcp-edge.sock
+//! Run (defaults: both tools, /tmp/mcp-edge.sock):
+//!   cargo run --example sensor
+//!
+//! For the gateway demo, run two single-tool instances on distinct sockets:
+//!   TOOL=temp     SOCK=/tmp/leaf1.sock cargo run --example sensor
+//!   TOOL=humidity SOCK=/tmp/leaf2.sock cargo run --example sensor
+//!
+//! Test:  echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | nc -U /tmp/mcp-edge.sock
 
 use core::fmt::Write;
 use mcp_edge::transport::UnixTransport;
@@ -38,8 +44,15 @@ fn main() {
     let humidity = HumiditySensor;
 
     let mut rt: Runtime<'_, 2> = Runtime::new();
-    rt.register(&temp);
-    rt.register(&humidity);
+    match std::env::var("TOOL").ok().as_deref() {
+        Some("temp")     => rt.register(&temp).unwrap(),
+        Some("humidity") => rt.register(&humidity).unwrap(),
+        _ => {
+            rt.register(&temp).unwrap();
+            rt.register(&humidity).unwrap();
+        }
+    }
 
-    UnixTransport::new("/tmp/mcp-edge.sock").serve(|msg, out| rt.handle(msg, out));
+    let path = std::env::var("SOCK").unwrap_or_else(|_| "/tmp/mcp-edge.sock".into());
+    UnixTransport::new(&path).serve(|msg, out| rt.handle(msg, out));
 }

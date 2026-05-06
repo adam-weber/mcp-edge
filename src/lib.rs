@@ -29,7 +29,7 @@
 //!
 //! let sensor = PingSensor;
 //! let mut rt: Runtime<'_, 1> = Runtime::new();
-//! rt.register(&sensor);
+//! rt.register(&sensor).unwrap();
 //!
 //! let mut out = [0u8; 256];
 //! let n = rt.handle(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}", &mut out);
@@ -59,9 +59,15 @@ impl core::fmt::Write for Output<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         // Invariant: self.len <= self.buf.len(), so plain sub never underflows.
         debug_assert!(self.len <= self.buf.len());
-        let n = s.len().min(self.buf.len() - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
+        // Fail loudly on overflow rather than silently truncating: a typical
+        // `write!(out, "...").unwrap()` will panic at the offending site,
+        // surfacing an undersized `OUT` const generic instead of shipping
+        // a truncated tool result wrapped in invalid JSON.
+        if s.len() > self.buf.len() - self.len {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
         Ok(())
     }
 }
@@ -117,11 +123,14 @@ pub struct Runtime<'p, const N: usize = 8, const OUT: usize = 512> {
 impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
     pub fn new() -> Self { Self { providers: [None; N], count: 0 } }
 
-    /// Register a provider. Panics if more than `N` providers are registered.
-    pub fn register(&mut self, p: &'p dyn Provider) {
-        assert!(self.count < N, "exceeded provider limit");
+    /// Register a provider. Returns `Err` if more than `N` providers have been
+    /// registered, matching `Gateway::add_leaf`'s error-returning shape so
+    /// callers can choose how to react (typically `.unwrap()` at startup).
+    pub fn register(&mut self, p: &'p dyn Provider) -> Result<(), &'static str> {
+        if self.count >= N { return Err("provider limit (N) reached"); }
         self.providers[self.count] = Some(p);
         self.count += 1;
+        Ok(())
     }
 
     /// Dispatch one newline-terminated JSON-RPC message.
@@ -129,7 +138,13 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
     pub fn handle(&self, msg: &[u8], out: &mut [u8]) -> usize {
         let mut w = Writer::new(out);
 
-        let Ok((req, _)) = serde_json_core::from_slice::<Req>(msg) else { return 0 };
+        let Ok((req, _)) = serde_json_core::from_slice::<Req>(msg) else {
+            // JSON-RPC 2.0: parse error → respond with id:null and code -32700,
+            // so the client gets a clear error instead of an idle connection.
+            w.s(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#).nl();
+            if w.truncated { return 0; }
+            return w.pos;
+        };
 
         match req.method {
             "initialize" => write_initialize(&mut w, req.id),
@@ -152,6 +167,10 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
             _ => rpc_err(&mut w, req.id, -32601, "method not found"),
         }
 
+        // Drop a truncated response rather than ship malformed JSON: the
+        // client will see a closed/idle reply, which is louder and clearer
+        // than mysterious parse errors on a chopped-off message.
+        if w.truncated { return 0; }
         w.pos
     }
 
@@ -212,6 +231,25 @@ pub(crate) fn write_tool(w: &mut Writer, name: &str, desc: &str) {
     w.s(r#"{"name":""#).s(name)
      .s(r#"","description":""#).esc(desc)
      .s(r#"","inputSchema":{"type":"object"}}"#);
+}
+
+/// Exact byte count `write_tool` will produce for `(name, desc)`. Used by the
+/// gateway to pre-flight whether a tool entry will fit in its tools-list cache
+/// (so we can return an error at startup instead of silently truncating).
+#[cfg(feature = "gateway")]
+pub(crate) fn write_tool_size(name: &str, desc: &str) -> usize {
+    // Must match write_tool's literals exactly:
+    //   {"name":"NAME","description":"ESC(DESC)","inputSchema":{"type":"object"}}
+    //   ^^^^^^^^^      ^^^^^^^^^^^^^^^^^         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //   9              17                        33
+    9 + name.len() + 17 + esc_len(desc) + 33
+}
+
+#[cfg(feature = "gateway")]
+fn esc_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| if matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t') { 2 } else { 1 })
+        .sum()
 }
 
 pub(crate) fn rpc_err(w: &mut Writer, id: u64, code: i32, msg: &str) {
@@ -330,23 +368,40 @@ pub(crate) fn sp(b: &[u8], mut p: usize) -> usize {
 pub(crate) struct Writer<'a> {
     buf: &'a mut [u8],
     pub(crate) pos: usize,
+    /// Set when any write would overflow the buffer. Once truncated, all
+    /// subsequent writes no-op so downstream content can't get reordered or
+    /// corrupted. Callers (`Runtime::handle`, `Gateway::handle`) check this
+    /// and drop the response rather than send malformed JSON to the client.
+    pub(crate) truncated: bool,
 }
 
 impl<'a> Writer<'a> {
-    pub(crate) fn new(buf: &'a mut [u8]) -> Self { Self { buf, pos: 0 } }
+    pub(crate) fn new(buf: &'a mut [u8]) -> Self { Self { buf, pos: 0, truncated: false } }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> &mut Self {
-        // Invariant: self.pos <= self.buf.len(), so plain sub never underflows.
+        if self.truncated { return self; }
         debug_assert!(self.pos <= self.buf.len());
-        let n = bytes.len().min(self.buf.len() - self.pos);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
-        self.pos += n;
+        // All-or-nothing: a partial write would emit invalid JSON anyway, and
+        // letting later writes succeed after a partial one would re-order the
+        // output relative to the source.
+        if bytes.len() > self.buf.len() - self.pos {
+            self.truncated = true;
+            return self;
+        }
+        self.buf[self.pos..self.pos + bytes.len()].copy_from_slice(bytes);
+        self.pos += bytes.len();
         self
     }
 
     pub(crate) fn s(&mut self, s: &str) -> &mut Self { self.push(s.as_bytes()) }
     pub(crate) fn nl(&mut self) -> &mut Self {
-        if self.pos < self.buf.len() { self.buf[self.pos] = b'\n'; self.pos += 1; }
+        if self.truncated { return self; }
+        if self.pos < self.buf.len() {
+            self.buf[self.pos] = b'\n';
+            self.pos += 1;
+        } else {
+            self.truncated = true;
+        }
         self
     }
 
@@ -360,6 +415,7 @@ impl<'a> Writer<'a> {
     }
 
     pub(crate) fn esc(&mut self, s: &str) -> &mut Self {
+        if self.truncated { return self; }
         // Bulk-copy runs of plain bytes between escape chars. `iter().position`
         // with a constant set of needles is loop-friendly (LLVM often
         // auto-vectorizes on x86/NEON), and `push` lowers to one memcpy per
@@ -372,7 +428,10 @@ impl<'a> Writer<'a> {
                 .iter()
                 .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t'));
             let end = rel.map(|r| i + r).unwrap_or(bytes.len());
-            if end > i { self.push(&bytes[i..end]); }
+            if end > i {
+                self.push(&bytes[i..end]);
+                if self.truncated { return self; }
+            }
             let Some(r) = rel else { break };
             let second = match bytes[i + r] {
                 b'"'  => b'"',
@@ -382,13 +441,16 @@ impl<'a> Writer<'a> {
                 b'\t' => b't',
                 _ => unreachable!(),
             };
+            // Two-byte escape is all-or-nothing: an orphan `\` would be
+            // interpreted as starting an escape against whatever byte follows
+            // (often the closing `"`), corrupting the JSON.
             if self.pos + 2 <= self.buf.len() {
                 self.buf[self.pos]     = b'\\';
                 self.buf[self.pos + 1] = second;
                 self.pos += 2;
-            } else if self.pos < self.buf.len() {
-                self.buf[self.pos] = b'\\';
-                self.pos += 1;
+            } else {
+                self.truncated = true;
+                return self;
             }
             i = end + 1;
         }
@@ -415,12 +477,15 @@ pub mod transport {
 
     /// Unix socket transport. Serves one client at a time.
     /// I/O buffers are stack-allocated — no heap in the connection loop.
-    pub struct UnixTransport {
-        path: &'static str,
+    ///
+    /// The lifetime parameter lets callers pass any `&str` (env-var-derived
+    /// `String`s, args, etc.) without leaking to `'static`.
+    pub struct UnixTransport<'a> {
+        path: &'a str,
     }
 
-    impl UnixTransport {
-        pub fn new(path: &'static str) -> Self {
+    impl<'a> UnixTransport<'a> {
+        pub fn new(path: &'a str) -> Self {
             let _ = std::fs::remove_file(path);
             Self { path }
         }
@@ -466,8 +531,12 @@ pub mod transport {
                         filled -= msg_start;
                         msg_start = 0;
                     }
-                    // Drop a message that overflows the buffer.
-                    if filled == rx.len() { filled = 0; }
+                    // Oversized message (> rx.len() with no newline): close the
+                    // connection. Resetting `filled` would re-interpret the
+                    // tail of the dropped message as a fresh request and parse
+                    // garbage — closing makes the failure visible to the
+                    // client, which can reconnect cleanly.
+                    if filled == rx.len() { break 'conn; }
                 }
             }
         }
@@ -508,7 +577,7 @@ mod tests {
     fn test_initialize() {
         static S: Stub = Stub;
         let mut rt: Runtime<'_, 1> = Runtime::new();
-        rt.register(&S);
+        rt.register(&S).unwrap();
         let mut out = [0u8; 512];
         let n = rt.handle(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", &mut out);
         let s = core::str::from_utf8(&out[..n]).unwrap();
@@ -519,7 +588,7 @@ mod tests {
     fn test_tools_list() {
         static S: Stub = Stub;
         let mut rt: Runtime<'_, 1> = Runtime::new();
-        rt.register(&S);
+        rt.register(&S).unwrap();
         let mut out = [0u8; 512];
         let n = rt.handle(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}", &mut out);
         let s = core::str::from_utf8(&out[..n]).unwrap();
@@ -531,7 +600,7 @@ mod tests {
     fn test_tool_call() {
         static S: Stub = Stub;
         let mut rt: Runtime<'_, 1> = Runtime::new();
-        rt.register(&S);
+        rt.register(&S).unwrap();
         let mut out = [0u8; 512];
         let n = rt.handle(
             b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"temp_read\",\"arguments\":{}}}",
@@ -555,7 +624,7 @@ mod tests {
         }
         static F: Fail = Fail;
         let mut rt: Runtime<'_, 1> = Runtime::new();
-        rt.register(&F);
+        rt.register(&F).unwrap();
         let mut out = [0u8; 512];
         let n = rt.handle(
             b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"boom\",\"arguments\":{}}}",
@@ -570,7 +639,7 @@ mod tests {
     fn test_unknown_tool() {
         static S: Stub = Stub;
         let mut rt: Runtime<'_, 1> = Runtime::new();
-        rt.register(&S);
+        rt.register(&S).unwrap();
         let mut out = [0u8; 512];
         let n = rt.handle(
             b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\",\"arguments\":{}}}",
@@ -587,7 +656,7 @@ mod tests {
         // A proper parser must find the actual method key, not a decoy.
         static S: Stub = Stub;
         let mut rt: Runtime<'_, 1> = Runtime::new();
-        rt.register(&S);
+        rt.register(&S).unwrap();
         let mut out = [0u8; 512];
         // "decoy" key comes first and its value contains "method":"evil"
         let msg = br#"{"jsonrpc":"2.0","decoy":"method:\"initialize\"","id":1,"method":"tools/list"}"#;
@@ -596,6 +665,52 @@ mod tests {
         // Should dispatch tools/list, not initialize
         assert!(s.contains("tools"), "{s}");
         assert!(!s.contains("protocolVersion"), "{s}");
+    }
+
+    #[test]
+    fn test_parse_error_response() {
+        // Malformed JSON must produce a JSON-RPC parse-error reply with
+        // id:null and code -32700, not a silent zero-byte drop.
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 256];
+        let n = rt.handle(b"this is not json", &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.contains(r#""id":null"#), "{s}");
+        assert!(s.contains("-32700"), "{s}");
+        assert!(s.contains("parse error"), "{s}");
+    }
+
+    #[test]
+    fn test_register_returns_err_when_full() {
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        assert!(rt.register(&S).is_ok());
+        assert!(rt.register(&S).is_err(), "second register past N must Err, not panic");
+    }
+
+    #[test]
+    fn test_response_truncation_drops_response() {
+        // A 16-byte out buffer can't hold any well-formed JSON-RPC reply,
+        // so handle() must return 0 (drop) rather than emit garbage.
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 16];
+        let n = rt.handle(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}", &mut out);
+        assert_eq!(n, 0, "truncated response must be dropped, not partially emitted");
+    }
+
+    #[test]
+    fn test_output_overflow_returns_err() {
+        // Writing more than OUT bytes from a tool must produce fmt::Error so
+        // user code (`write!(...).unwrap()`) panics loudly instead of silently
+        // truncating.
+        let mut buf = [0u8; 4];
+        let mut out = Output::new(&mut buf);
+        let r = core::fmt::Write::write_str(&mut out, "too long");
+        assert!(r.is_err(), "Output::write_str must Err on overflow, got Ok");
     }
 
     #[test]

@@ -1,11 +1,13 @@
 //! Example: a gateway that aggregates two leaf devices.
 //!
-//! Start two leaves first (in separate terminals):
-//!   cargo run --example sensor
-//!   SOCK=/tmp/mcp-edge2.sock cargo run --example sensor  # TODO: make path configurable
+//! Start two leaves first, each exposing a single distinct tool:
+//!   TOOL=temp     SOCK=/tmp/leaf1.sock cargo run --example sensor
+//!   TOOL=humidity SOCK=/tmp/leaf2.sock cargo run --example sensor
 //!
 //! Then run the gateway:
 //!   cargo run --example gateway --features gateway
+//!
+//! Override sockets with env vars: LEAF1, LEAF2, SOCK.
 //!
 //! The gateway exposes all tools from all leaves under a single socket.
 //! Agents connect only to the gateway; leaves are invisible to them.
@@ -16,11 +18,14 @@ use mcp_edge::Gateway;
 fn main() {
     let mut gw: Gateway<2, 16> = Gateway::new();
 
-    // Connect to leaves and discover their tools.
-    // add_leaf blocks until the leaf responds.
-    gw.add_leaf("/tmp/leaf1.sock").expect("leaf1 not running — start it first");
-    gw.add_leaf("/tmp/leaf2.sock").expect("leaf2 not running — start it first");
+    let leaf1 = std::env::var("LEAF1").unwrap_or_else(|_| "/tmp/leaf1.sock".into());
+    let leaf2 = std::env::var("LEAF2").unwrap_or_else(|_| "/tmp/leaf2.sock".into());
 
-    println!("gateway ready");
-    UnixTransport::new("/tmp/gateway.sock").serve(|msg, out| gw.handle(msg, out));
+    // add_leaf blocks until the leaf responds; treat any error as fatal.
+    gw.add_leaf(&leaf1).expect("leaf1 unavailable — start it first");
+    gw.add_leaf(&leaf2).expect("leaf2 unavailable — start it first");
+
+    let path = std::env::var("SOCK").unwrap_or_else(|_| "/tmp/gateway.sock".into());
+    println!("gateway listening on {path}");
+    UnixTransport::new(&path).serve(|msg, out| gw.handle(msg, out));
 }
