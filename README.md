@@ -1,6 +1,6 @@
 # mcp-edge
 
-A minimal MCP runtime for resource-constrained devices. `no_std`-compatible core, zero heap allocation, fits in tens of KB of RAM.
+A minimal MCP runtime with a layered, pluggable architecture. `no_std`-compatible core, zero heap, fits in tens of KB of RAM. The same primitives serve a sensor on a Pi and a multi-device gateway over the network; ambitious pieces (TLS, custom transports) layer on through opt-in features.
 
 ## Getting Started
 
@@ -59,6 +59,13 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temp_read"
   | nc -U /tmp/mcp-edge.sock
 ```
 
+Cross-machine? Swap one line — same handler, different transport:
+
+```rust
+use mcp_edge::transport::TcpTransport;
+TcpTransport::new("0.0.0.0:9000").serve(|m, o| rt.handle(m, o));
+```
+
 Try the gateway aggregating two single-tool leaves:
 
 ```bash
@@ -82,9 +89,9 @@ mcp-edge is a library, not a framework. Your program:
 
 1. Constructs a `Runtime<N, OUT>` — `N` is the max provider count, `OUT` is the max bytes a single tool result may produce.
 2. Registers providers (each exposes one or more tools).
-3. Calls `UnixTransport::serve(|msg, out| rt.handle(msg, out))` to accept connections.
+3. Picks a transport (`UnixTransport` for local, `TcpTransport` for cross-machine) and calls `.serve(|msg, out| rt.handle(msg, out))`.
 
-The runtime parses JSON-RPC, dispatches `initialize`, `tools/list`, and `tools/call`, and writes replies into a caller-provided buffer. All sizes are const-generic, so the entire runtime lives on the stack — no allocator required.
+The runtime parses JSON-RPC, dispatches `initialize`, `tools/list`, and `tools/call`, and writes replies into a caller-provided buffer. All sizes are const-generic, so the entire runtime lives on the stack — no allocator required. Transports and gateway connectors are trait-shaped, so swapping in TLS, an `embedded-nal` stack, or a custom protocol doesn't touch the runtime.
 
 ```
 ┌───────────────────────────────────────────────┐
@@ -101,7 +108,8 @@ The runtime parses JSON-RPC, dispatches `initialize`, `tools/list`, and `tools/c
 │  │         └────────┬───────┘            │    │
 │  │                  │                    │    │
 │  │         ┌────────▼────────┐           │    │
-│  │         │  UnixTransport  │           │    │
+│  │         │    Transport    │           │    │
+│  │         │  (Unix / TCP)   │           │    │
 │  │         └────────┬────────┘           │    │
 │  └──────────────────│────────────────────┘    │
 │                     │                         │
@@ -226,6 +234,7 @@ Edge devices have constraints. mcp-edge respects them.
 - **Zero heap.** No `Vec`, `String`, `Box`, or `Arc`. All storage is in fixed arrays sized by const generics.
 - **You declare the limits.** Provider count `N`, tool-result size `OUT`, leaf count `L`, route table size `T`, gateway tools-list buffer `B` — all compile-time. Exceeding them returns an error at startup, not a silent truncation at runtime.
 - **Stack budgets.** A default `Runtime<'_, 8, 512>` peaks around `OUT` bytes of stack on the `tools/call` path and ~80 bytes on every other path. A default `Gateway<4, 32, 2048>` is ~3.6 KB resident with a ~1.3 KB per-call stack peak.
+- **Pluggable, not bloated.** `Transport` (Unix/TCP, TLS planned) and `Connector` (how the gateway reaches each leaf) are trait boundaries. Default impls are zero-sized — heavyweight integrations live behind feature flags or sibling crates.
 - **`no_std` compatible.** The core runtime builds without `std`. Disable default features for `no_std` targets:
   ```toml
   mcp-edge = { version = "0.1", default-features = false }
