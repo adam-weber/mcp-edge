@@ -16,15 +16,16 @@
 //! Default `Gateway<4, 32, 2048>` ≈ 436 + 1088 + 2048 + 12 = **3.6 KB**.
 //!
 //! Per-call peak stack in `handle()` → `proxy_call()`:
-//! - 128-byte request buffer + 1024-byte response buffer = **1.2 KB**.
+//! - 256-byte request buffer + 1024-byte response buffer + 280-byte read buffer = **1.6 KB**.
 
-use crate::{obj_get, rpc_err, skip_delimited, Writer};
+use crate::{obj_get, rpc_err, skip_delimited, write_initialize, write_tool, Writer};
 use serde::Deserialize;
 use std::io::{Read, Write as IoWrite};
 use std::os::unix::net::UnixStream;
 
 const PATH_MAX: usize = 108; // UNIX_PATH_MAX
 const NAME_MAX: usize = 32;
+const INIT_MSG: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}\n";
 
 // ---------------------------------------------------------------------------
 // Internal storage — all Copy so they live in fixed arrays, no heap
@@ -116,13 +117,12 @@ impl<const L: usize, const T: usize, const B: usize> Gateway<L, T, B> {
         let mut resp = [0u8; 4096]; // generous: tools/list response can be large
         let n = {
             let mut conn = UnixStream::connect(path).map_err(|_| "connect failed")?;
-            conn.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}\n")
-                .map_err(|_| "write failed")?;
-            read_line(&mut conn, &mut resp).ok_or("no initialize response")?;
+            conn.write_all(INIT_MSG).map_err(|_| "write failed")?;
+            Reader::new(&mut conn).read_line(&mut resp).ok_or("no initialize response")?;
 
             conn.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
                 .map_err(|_| "write failed")?;
-            read_line(&mut conn, &mut resp).ok_or("no tools/list response")?
+            Reader::new(&mut conn).read_line(&mut resp).ok_or("no tools/list response")?
         };
 
         let result = obj_get(&resp[..n], b"result").ok_or("no result in leaf response")?;
@@ -137,12 +137,12 @@ impl<const L: usize, const T: usize, const B: usize> Gateway<L, T, B> {
         self.leaf_count += 1;
 
         // Iterate `[{...},{...}]` without allocating.
-        let mut p = crate::sp(tools_arr,0);
+        let mut p = crate::sp(tools_arr, 0);
         if tools_arr.get(p) != Some(&b'[') { return Ok(()); }
         p += 1;
 
         loop {
-            p = crate::sp(tools_arr,p);
+            p = crate::sp(tools_arr, p);
             match tools_arr.get(p) {
                 Some(b']') | None => break,
                 Some(b',') => { p += 1; continue; }
@@ -166,12 +166,12 @@ impl<const L: usize, const T: usize, const B: usize> Gateway<L, T, B> {
 
     fn add_route(&mut self, name: &str, leaf: u8) {
         if self.route_count >= T { return; }
+        // Slot is already zeroed from Gateway::new(); write fields directly.
+        let slot = &mut self.routes[self.route_count];
         let n = name.len().min(NAME_MAX);
-        let mut r = Route::EMPTY;
-        r.name[..n].copy_from_slice(&name.as_bytes()[..n]);
-        r.len = n as u8;
-        r.leaf = leaf;
-        self.routes[self.route_count] = r;
+        slot.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+        slot.len = n as u8;
+        slot.leaf = leaf;
         self.route_count += 1;
     }
 
@@ -181,9 +181,7 @@ impl<const L: usize, const T: usize, const B: usize> Gateway<L, T, B> {
             self.tools_json_len += 1;
         }
         let mut w = Writer::new(&mut self.tools_json[self.tools_json_len..]);
-        w.s(r#"{"name":""#).s(name)
-         .s(r#"","description":""#).esc(desc)
-         .s(r#"","inputSchema":{"type":"object"}}"#);
+        write_tool(&mut w, name, desc);
         self.tools_json_len += w.pos;
     }
 
@@ -201,11 +199,7 @@ impl<const L: usize, const T: usize, const B: usize> Gateway<L, T, B> {
         let Ok((req, _)) = serde_json_core::from_slice::<crate::Req>(msg) else { return 0 };
 
         match req.method {
-            "initialize" => {
-                w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id)
-                 .s(r#","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}"#)
-                 .nl();
-            }
+            "initialize" => write_initialize(&mut w, req.id),
             "tools/list" => {
                 w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id).s(r#","result":{"tools":["#);
                 w.push(&self.tools_json[..self.tools_json_len]);
@@ -265,13 +259,11 @@ fn proxy_call(leaf_path: &str, tool: &str, args: &[u8], req_id: u64, w: &mut Wri
 
     let Ok(mut conn) = UnixStream::connect(leaf_path) else { return false };
 
-    if conn.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}\n").is_err() {
-        return false;
-    }
-    if read_line(&mut conn, &mut resp_buf).is_none() { return false; }
+    if conn.write_all(INIT_MSG).is_err() { return false; }
+    if Reader::new(&mut conn).read_line(&mut resp_buf).is_none() { return false; }
 
     if conn.write_all(&req_buf[..req_n]).is_err() { return false; }
-    let Some(rn) = read_line(&mut conn, &mut resp_buf) else { return false };
+    let Some(rn) = Reader::new(&mut conn).read_line(&mut resp_buf) else { return false };
 
     let resp = &resp_buf[..rn];
     w.s(r#"{"jsonrpc":"2.0","id":"#).u(req_id);
@@ -288,16 +280,33 @@ fn proxy_call(leaf_path: &str, tool: &str, args: &[u8], req_id: u64, w: &mut Wri
 }
 
 // ---------------------------------------------------------------------------
-// Local helpers
+// Buffered line reader — bulk reads to avoid one syscall per byte
 // ---------------------------------------------------------------------------
 
-fn read_line(conn: &mut UnixStream, buf: &mut [u8]) -> Option<usize> {
-    let mut pos = 0;
-    loop {
-        let mut b = [0u8; 1];
-        conn.read_exact(&mut b).ok()?;
-        if b[0] == b'\n' { return Some(pos); }
-        if pos < buf.len() { buf[pos] = b[0]; pos += 1; }
+struct Reader<'a> {
+    conn:  &'a mut UnixStream,
+    buf:   [u8; 256],
+    start: usize,
+    end:   usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(conn: &'a mut UnixStream) -> Self {
+        Self { conn, buf: [0u8; 256], start: 0, end: 0 }
+    }
+
+    fn read_line(&mut self, out: &mut [u8]) -> Option<usize> {
+        let mut pos = 0;
+        loop {
+            if self.start >= self.end {
+                self.start = 0;
+                self.end = self.conn.read(&mut self.buf).ok().filter(|&n| n > 0)?;
+            }
+            let b = self.buf[self.start];
+            self.start += 1;
+            if b == b'\n' { return Some(pos); }
+            if pos < out.len() { out[pos] = b; pos += 1; }
+        }
     }
 }
 

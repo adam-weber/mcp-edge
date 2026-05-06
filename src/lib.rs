@@ -130,11 +130,7 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
         let Ok((req, _)) = serde_json_core::from_slice::<Req>(msg) else { return 0 };
 
         match req.method {
-            "initialize" => {
-                w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id)
-                 .s(r#","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}"#)
-                 .nl();
-            }
+            "initialize" => write_initialize(&mut w, req.id),
             "tools/list" => {
                 w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id).s(r#","result":{"tools":["#);
                 let mut first = true;
@@ -142,9 +138,7 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
                     for t in self.providers[i].unwrap().tools() {
                         if !first { w.s(","); }
                         first = false;
-                        w.s(r#"{"name":""#).s(t.name)
-                         .s(r#"","description":""#).esc(t.description)
-                         .s(r#"","inputSchema":{"type":"object"}}"#);
+                        write_tool(&mut w, t.name, t.description);
                     }
                 }
                 w.s("]}}").nl();
@@ -206,6 +200,18 @@ impl<'p, const N: usize, const OUT: usize> Default for Runtime<'p, N, OUT> {
     fn default() -> Self { Self::new() }
 }
 
+pub(crate) fn write_initialize(w: &mut Writer, id: u64) {
+    w.s(r#"{"jsonrpc":"2.0","id":"#).u(id)
+     .s(r#","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}"#)
+     .nl();
+}
+
+pub(crate) fn write_tool(w: &mut Writer, name: &str, desc: &str) {
+    w.s(r#"{"name":""#).s(name)
+     .s(r#"","description":""#).esc(desc)
+     .s(r#"","inputSchema":{"type":"object"}}"#);
+}
+
 pub(crate) fn rpc_err(w: &mut Writer, id: u64, code: i32, msg: &str) {
     w.s(r#"{"jsonrpc":"2.0","id":"#).u(id)
      .s(r#","error":{"code":"#).i(code).s(r#","message":""#)
@@ -220,6 +226,7 @@ pub(crate) fn rpc_err(w: &mut Writer, id: u64, code: i32, msg: &str) {
 // Returns the raw bytes of the value (including delimiters for objects/arrays).
 // ---------------------------------------------------------------------------
 
+#[inline]
 pub(crate) fn obj_get<'a>(obj: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     let mut p = sp(obj, 0);
     if obj.get(p)? != &b'{' { return None; }
@@ -255,6 +262,7 @@ pub(crate) fn obj_get<'a>(obj: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 }
 
 // Advance p past one JSON value.
+#[inline]
 fn skip_val(b: &[u8], p: &mut usize) -> Option<()> {
     *p = sp(b, *p);
     match b.get(*p)? {
@@ -265,7 +273,7 @@ fn skip_val(b: &[u8], p: &mut usize) -> Option<()> {
         b'f' => { *p += 5; Some(()) }
         b'n' => { *p += 4; Some(()) }
         b'-' | b'0'..=b'9' => {
-            while b.get(*p).map_or(false, |c| matches!(c, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')) {
+            while *p < b.len() && matches!(b[*p], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
                 *p += 1;
             }
             Some(())
@@ -276,6 +284,7 @@ fn skip_val(b: &[u8], p: &mut usize) -> Option<()> {
 
 // Advance p past the body of a string; p must point just after the opening quote.
 // Leaves p pointing just after the closing quote.
+#[inline]
 pub(crate) fn eat_str(b: &[u8], p: &mut usize) -> Option<()> {
     while *p < b.len() {
         match b[*p] {
@@ -289,6 +298,7 @@ pub(crate) fn eat_str(b: &[u8], p: &mut usize) -> Option<()> {
 
 // Advance p past a matched open/close pair, handling strings and nesting.
 // p must point at `open` on entry.
+#[inline]
 pub(crate) fn skip_delimited(b: &[u8], p: &mut usize, open: u8, close: u8) -> Option<()> {
     debug_assert_eq!(b[*p], open);
     *p += 1;
@@ -305,6 +315,7 @@ pub(crate) fn skip_delimited(b: &[u8], p: &mut usize, open: u8, close: u8) -> Op
 }
 
 // Skip whitespace, returning the new position.
+#[inline]
 pub(crate) fn sp(b: &[u8], mut p: usize) -> usize {
     while p < b.len() && matches!(b[p], b' ' | b'\t' | b'\n' | b'\r') { p += 1; }
     p
@@ -330,7 +341,10 @@ impl<'a> Writer<'a> {
     }
 
     pub(crate) fn s(&mut self, s: &str) -> &mut Self { self.push(s.as_bytes()) }
-    pub(crate) fn nl(&mut self) -> &mut Self { self.push(b"\n") }
+    pub(crate) fn nl(&mut self) -> &mut Self {
+        if self.pos < self.buf.len() { self.buf[self.pos] = b'\n'; self.pos += 1; }
+        self
+    }
 
     pub(crate) fn u(&mut self, n: u64) -> &mut Self {
         let mut tmp = [0u8; 20];
@@ -343,17 +357,29 @@ impl<'a> Writer<'a> {
 
     pub(crate) fn esc(&mut self, s: &str) -> &mut Self {
         for b in s.bytes() {
-            match b {
-                b'"'  => { self.push(b"\\\""); }
-                b'\\' => { self.push(b"\\\\"); }
-                b'\n' => { self.push(b"\\n"); }
-                b'\r' => { self.push(b"\\r"); }
-                b'\t' => { self.push(b"\\t"); }
-                _ if self.pos < self.buf.len() => {
-                    self.buf[self.pos] = b;
-                    self.pos += 1;
+            // Map special chars to their escape suffix; plain chars go direct.
+            let second: u8 = match b {
+                b'"'  => b'"',
+                b'\\' => b'\\',
+                b'\n' => b'n',
+                b'\r' => b'r',
+                b'\t' => b't',
+                _ => {
+                    if self.pos < self.buf.len() {
+                        self.buf[self.pos] = b;
+                        self.pos += 1;
+                    }
+                    continue;
                 }
-                _ => {}
+            };
+            // Write backslash + escape char directly — avoids copy_from_slice overhead.
+            if self.pos + 1 < self.buf.len() {
+                self.buf[self.pos]     = b'\\';
+                self.buf[self.pos + 1] = second;
+                self.pos += 2;
+            } else if self.pos < self.buf.len() {
+                self.buf[self.pos] = b'\\';
+                self.pos += 1;
             }
         }
         self
@@ -401,20 +427,37 @@ pub mod transport {
             for mut conn in listener.incoming().flatten() {
                 let mut rx = [0u8; 1024];
                 let mut tx = [0u8; 1024];
-                let mut rx_pos = 0usize;
-                loop {
-                    let mut byte = [0u8; 1];
-                    if conn.read_exact(&mut byte).is_err() { break; }
-                    if byte[0] == b'\n' {
-                        if rx_pos > 0 {
-                            let n = handler(&rx[..rx_pos], &mut tx);
-                            if conn.write_all(&tx[..n]).is_err() { break; }
+                let mut filled = 0usize;    // valid bytes in rx
+                let mut msg_start = 0usize; // start of next unprocessed message
+                'conn: loop {
+                    // Bulk read — one syscall for potentially many bytes.
+                    let n = match conn.read(&mut rx[filled..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    filled += n;
+                    // Process every complete (newline-terminated) message in the buffer.
+                    loop {
+                        match rx[msg_start..filled].iter().position(|&b| b == b'\n') {
+                            None => break,
+                            Some(rel) => {
+                                let msg_end = msg_start + rel;
+                                if msg_end > msg_start {
+                                    let n = handler(&rx[msg_start..msg_end], &mut tx);
+                                    if conn.write_all(&tx[..n]).is_err() { break 'conn; }
+                                }
+                                msg_start = msg_end + 1;
+                            }
                         }
-                        rx_pos = 0;
-                    } else if rx_pos < rx.len() {
-                        rx[rx_pos] = byte[0];
-                        rx_pos += 1;
                     }
+                    // Compact: slide unconsumed bytes to the front.
+                    if msg_start > 0 {
+                        rx.copy_within(msg_start..filled, 0);
+                        filled -= msg_start;
+                        msg_start = 0;
+                    }
+                    // Drop a message that overflows the buffer.
+                    if filled == rx.len() { filled = 0; }
                 }
             }
         }
