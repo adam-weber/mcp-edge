@@ -29,7 +29,7 @@ impl Provider for TempSensor {
     }
 
     fn call(&self, _tool: &str, _args: &[u8], out: &mut Output) -> Result<(), &'static str> {
-        // Replace with your real sensor read; fixed value here for demo.
+        // Replace with your sensor read; fixed value here for demo.
         write!(out, "22.5").unwrap();
         Ok(())
     }

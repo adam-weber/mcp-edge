@@ -31,5 +31,9 @@ name = "stdio"
 required-features = ["std"]
 
 [[example]]
+name = "wrap"
+required-features = ["std"]
+
+[[example]]
 name = "gateway"
 required-features = ["gateway"]
