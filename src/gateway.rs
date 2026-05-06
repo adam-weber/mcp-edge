@@ -280,10 +280,10 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
     ///
     /// On error the gateway may have partially registered some routes for this
     /// leaf — treat any error as fatal and abort startup rather than continuing.
-    pub fn add_leaf(&mut self, path: &str) -> Result<(), &'static str> {
+    pub fn add_leaf(&mut self, addr: &str) -> Result<(), &'static str> {
         if self.leaf_count >= L { return Err("leaf limit reached"); }
-        if path.is_empty() { return Err("leaf address is empty"); }
-        if path.len() > LEAF_ADDR_MAX { return Err("leaf address exceeds LEAF_ADDR_MAX bytes"); }
+        if addr.is_empty() { return Err("leaf address is empty"); }
+        if addr.len() > LEAF_ADDR_MAX { return Err("leaf address exceeds LEAF_ADDR_MAX bytes"); }
 
         // Discover tools before committing the leaf slot, so a failed
         // connection doesn't waste an index. Goes through the connector so
@@ -291,7 +291,7 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         // transport — startup matches runtime.
         let mut resp = [0u8; 4096]; // generous: tools/list response can be large
         let n = {
-            let mut conn = self.connector.connect(path)?;
+            let mut conn = self.connector.connect(addr)?;
             conn.write_all(INIT_MSG).map_err(|_| "write failed")?;
             // Validate the leaf accepted initialize before proceeding —
             // otherwise we'd silently overwrite the error response with the
@@ -311,15 +311,15 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
 
         // Commit the leaf slot only after a successful connection.
         // Casts to u8 below: leaf_count < L <= 255 (gateway can't index more
-        // than 255 leaves anyway), and path.len() <= LEAF_ADDR_MAX = 108
+        // than 255 leaves anyway), and addr.len() <= LEAF_ADDR_MAX = 108
         // (checked above).
         #[allow(clippy::cast_possible_truncation)]
         let leaf_idx = self.leaf_count as u8;
-        let path_bytes = path.as_bytes();
-        self.leaves[self.leaf_count].addr[..path_bytes.len()].copy_from_slice(path_bytes);
+        let addr_bytes = addr.as_bytes();
+        self.leaves[self.leaf_count].addr[..addr_bytes.len()].copy_from_slice(addr_bytes);
         #[allow(clippy::cast_possible_truncation)]
         {
-            self.leaves[self.leaf_count].len = path_bytes.len() as u8;
+            self.leaves[self.leaf_count].len = addr_bytes.len() as u8;
         }
         self.leaf_count += 1;
 
@@ -431,9 +431,9 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
 
                 match self.find_leaf(tc.name) {
                     Some(idx) => {
-                        let leaf_path = self.leaves[idx].as_str();
+                        let leaf_addr = self.leaves[idx].as_str();
                         let start = w.pos;
-                        if let Err(e) = self.proxy_call(leaf_path, tc.name, args, id, &mut w) {
+                        if let Err(e) = self.proxy_call(leaf_addr, tc.name, args, id, &mut w) {
                             w.pos = start;
                             rpc_err(&mut w, id, -1, e);
                         }
@@ -455,7 +455,7 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
     /// on the proxy hot path.
     fn proxy_call(
         &self,
-        leaf_path: &str,
+        leaf_addr: &str,
         tool: &str,
         args: &[u8],
         req_id: &[u8],
@@ -475,7 +475,7 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         // content wrapped in ~80 bytes of JSON envelope).
         let mut resp_buf = [0u8; 1024];
 
-        let mut conn = self.connector.connect(leaf_path)?;
+        let mut conn = self.connector.connect(leaf_addr)?;
 
         // No per-call `initialize`: the leaf was verified once at startup in
         // `add_leaf` and our runtime is stateless, so we go straight to
