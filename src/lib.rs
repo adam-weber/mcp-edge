@@ -57,7 +57,9 @@ impl<'a> Output<'a> {
 
 impl core::fmt::Write for Output<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let n = s.len().min(self.buf.len().saturating_sub(self.len));
+        // Invariant: self.len <= self.buf.len(), so plain sub never underflows.
+        debug_assert!(self.len <= self.buf.len());
+        let n = s.len().min(self.buf.len() - self.len);
         self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
         self.len += n;
         Ok(())
@@ -134,8 +136,9 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
             "tools/list" => {
                 w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id).s(r#","result":{"tools":["#);
                 let mut first = true;
-                for i in 0..self.count {
-                    for t in self.providers[i].unwrap().tools() {
+                // filter_map(|x| *x) avoids the panic codegen of unwrap().
+                for p in self.providers[..self.count].iter().filter_map(|x| *x) {
+                    for t in p.tools() {
                         if !first { w.s(","); }
                         first = false;
                         write_tool(&mut w, t.name, t.description);
@@ -153,11 +156,10 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
     }
 
     fn find(&self, tool: &str) -> Option<&dyn Provider> {
-        for i in 0..self.count {
-            let p = self.providers[i].unwrap();
-            if p.tools().iter().any(|t| t.name == tool) { return Some(p); }
-        }
-        None
+        self.providers[..self.count]
+            .iter()
+            .filter_map(|x| *x)
+            .find(|p| p.tools().iter().any(|t| t.name == tool))
     }
 
     // Separate function so [0u8; OUT] is stack-allocated only on the tools/call path,
@@ -334,7 +336,9 @@ impl<'a> Writer<'a> {
     pub(crate) fn new(buf: &'a mut [u8]) -> Self { Self { buf, pos: 0 } }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> &mut Self {
-        let n = bytes.len().min(self.buf.len().saturating_sub(self.pos));
+        // Invariant: self.pos <= self.buf.len(), so plain sub never underflows.
+        debug_assert!(self.pos <= self.buf.len());
+        let n = bytes.len().min(self.buf.len() - self.pos);
         self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
         self.pos += n;
         self
