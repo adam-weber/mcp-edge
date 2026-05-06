@@ -12,8 +12,9 @@ cargo add mcp-edge
 
 Optional features:
 
-- `std` (default) — enables `UnixTransport`
+- `std` (default) — enables `UnixTransport` and `TcpTransport`
 - `gateway` — enables `Gateway` for aggregating multiple leaves under one socket (requires `std`)
+- `tls` — reserves the `tls://` leaf-address scheme in `MultiConnector` (the rustls integration lands in a follow-up; today the surface compiles but `tls://` returns "tls connector not yet implemented")
 
 ### Minimal Example
 
@@ -194,6 +195,22 @@ fn main() {
     gw.add_leaf("/run/leaves/cnc.sock").expect("cnc leaf unavailable");
     UnixTransport::new("/run/workshop.sock").serve(|m, o| gw.handle(m, o));
 }
+```
+
+The default `Gateway` uses `MultiConnector`, which dispatches on a URL prefix in each `add_leaf` address — so the same gateway can mix transports:
+
+```rust
+gw.add_leaf("/run/leaves/climate.sock").unwrap();    // bare path → Unix
+gw.add_leaf("unix:///run/leaves/power.sock").unwrap(); // explicit Unix
+gw.add_leaf("tcp://10.0.0.5:9000").unwrap();         // remote leaf over TCP
+gw.add_leaf("tls://factory.local:9001").unwrap();    // remote leaf over TLS (requires `tls` feature)
+```
+
+For a leaner, Unix-only build, pin the connector explicitly:
+
+```rust
+use mcp_edge::gateway::UnixConnector;
+let mut gw: Gateway<3, 16, 2048, UnixConnector> = Gateway::new();
 ```
 
 An agent connects only to `/run/workshop.sock` and sees eight tools as one flat namespace. Asked *"is the CNC running and how much solar power are we generating?"* it calls `cnc_state` and `solar_w` — the gateway routes each to the right leaf and proxies the answer back. Agents never see the topology.

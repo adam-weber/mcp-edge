@@ -467,13 +467,67 @@ fn fmt_u64(n: u64, buf: &mut [u8; 20]) -> &[u8] {
 }
 
 // ---------------------------------------------------------------------------
-// Unix socket transport — std-only
+// Transports — std-only
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
 pub mod transport {
     use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::os::unix::net::UnixListener;
+
+    /// Drive one connection's read/write loop. Generic over any `Read + Write`
+    /// stream so it serves Unix, TCP, TLS-wrapped, etc., transports identically.
+    ///
+    /// Static dispatch on `H: Fn` keeps the per-message call into the handler a
+    /// direct call, not an indirect one — the loop is the hot path on a busy
+    /// gateway. `#[inline(never)]` keeps the 2 KB rx/tx buffers in this
+    /// function's frame instead of inlining them into every transport's
+    /// `serve()` accept loop.
+    #[inline(never)]
+    pub fn run_connection<C, H>(mut conn: C, handler: &H)
+    where
+        C: Read + Write,
+        H: Fn(&[u8], &mut [u8]) -> usize + ?Sized,
+    {
+        let mut rx = [0u8; 1024];
+        let mut tx = [0u8; 1024];
+        let mut filled = 0usize;    // valid bytes in rx
+        let mut msg_start = 0usize; // start of next unprocessed message
+        'conn: loop {
+            // Bulk read — one syscall for potentially many bytes.
+            let n = match conn.read(&mut rx[filled..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            filled += n;
+            // Process every complete (newline-terminated) message in the buffer.
+            loop {
+                match rx[msg_start..filled].iter().position(|&b| b == b'\n') {
+                    None => break,
+                    Some(rel) => {
+                        let msg_end = msg_start + rel;
+                        if msg_end > msg_start {
+                            let n = handler(&rx[msg_start..msg_end], &mut tx);
+                            if conn.write_all(&tx[..n]).is_err() { break 'conn; }
+                        }
+                        msg_start = msg_end + 1;
+                    }
+                }
+            }
+            // Compact: slide unconsumed bytes to the front.
+            if msg_start > 0 {
+                rx.copy_within(msg_start..filled, 0);
+                filled -= msg_start;
+                msg_start = 0;
+            }
+            // Oversized message (> rx.len() with no newline): close the
+            // connection. Resetting `filled` would re-interpret the tail of
+            // the dropped message as a fresh request and parse garbage —
+            // closing makes the failure visible to the client.
+            if filled == rx.len() { break 'conn; }
+        }
+    }
 
     /// Unix socket transport. Serves one client at a time.
     /// I/O buffers are stack-allocated — no heap in the connection loop.
@@ -499,45 +553,28 @@ pub mod transport {
         pub fn serve(&self, handler: impl Fn(&[u8], &mut [u8]) -> usize) {
             let listener = UnixListener::bind(self.path).expect("bind failed");
             eprintln!("listening on {}", self.path);
-            for mut conn in listener.incoming().flatten() {
-                let mut rx = [0u8; 1024];
-                let mut tx = [0u8; 1024];
-                let mut filled = 0usize;    // valid bytes in rx
-                let mut msg_start = 0usize; // start of next unprocessed message
-                'conn: loop {
-                    // Bulk read — one syscall for potentially many bytes.
-                    let n = match conn.read(&mut rx[filled..]) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    filled += n;
-                    // Process every complete (newline-terminated) message in the buffer.
-                    loop {
-                        match rx[msg_start..filled].iter().position(|&b| b == b'\n') {
-                            None => break,
-                            Some(rel) => {
-                                let msg_end = msg_start + rel;
-                                if msg_end > msg_start {
-                                    let n = handler(&rx[msg_start..msg_end], &mut tx);
-                                    if conn.write_all(&tx[..n]).is_err() { break 'conn; }
-                                }
-                                msg_start = msg_end + 1;
-                            }
-                        }
-                    }
-                    // Compact: slide unconsumed bytes to the front.
-                    if msg_start > 0 {
-                        rx.copy_within(msg_start..filled, 0);
-                        filled -= msg_start;
-                        msg_start = 0;
-                    }
-                    // Oversized message (> rx.len() with no newline): close the
-                    // connection. Resetting `filled` would re-interpret the
-                    // tail of the dropped message as a fresh request and parse
-                    // garbage — closing makes the failure visible to the
-                    // client, which can reconnect cleanly.
-                    if filled == rx.len() { break 'conn; }
-                }
+            for conn in listener.incoming().flatten() {
+                run_connection(conn, &handler);
+            }
+        }
+    }
+
+    /// TCP socket transport. Same handler interface as `UnixTransport`.
+    /// Use this for cross-machine setups (LAN, automotive Ethernet, etc.).
+    /// For untrusted networks, layer TLS on top — see the `tls` feature
+    /// (planned) or wrap your own `rustls` acceptor and call `run_connection`.
+    pub struct TcpTransport<'a> {
+        addr: &'a str,
+    }
+
+    impl<'a> TcpTransport<'a> {
+        pub fn new(addr: &'a str) -> Self { Self { addr } }
+
+        pub fn serve(&self, handler: impl Fn(&[u8], &mut [u8]) -> usize) {
+            let listener = TcpListener::bind(self.addr).expect("bind failed");
+            eprintln!("listening on {}", self.addr);
+            for conn in listener.incoming().flatten() {
+                run_connection(conn, &handler);
             }
         }
     }

@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 default = ["std"]
 std = []
 gateway = ["std"]
+# `tls` reserves the `tls://` URL scheme in MultiConnector. The actual rustls
+# integration lands in a follow-up PR; today the surface compiles but the
+# tls:// arm returns "tls connector not yet implemented".
+tls = ["std"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
