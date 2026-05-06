@@ -96,9 +96,12 @@ pub trait Provider {
 // Serde structs — serde-json-core parses id / method / tool name
 // ---------------------------------------------------------------------------
 
+// JSON-RPC `id` is intentionally absent from this struct: the spec permits
+// `string | number | null`, so we extract it as raw bytes via `obj_get` and
+// echo it verbatim into the response. That keeps the runtime type-agnostic
+// without dragging in a heap-allocating Value type.
 #[derive(Deserialize)]
 pub(crate) struct Req<'a> {
-    pub(crate) id: u64,
     pub(crate) method: &'a str,
 }
 
@@ -146,10 +149,14 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
             return w.pos;
         };
 
+        // Echo the id raw — JSON-RPC permits string|number|null, and we don't
+        // need to interpret it.
+        let id = obj_get(msg, b"id").unwrap_or(b"null");
+
         match req.method {
-            "initialize" => write_initialize(&mut w, req.id),
+            "initialize" => write_initialize(&mut w, id),
             "tools/list" => {
-                w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id).s(r#","result":{"tools":["#);
+                w.s(r#"{"jsonrpc":"2.0","id":"#).push(id).s(r#","result":{"tools":["#);
                 let mut first = true;
                 // filter_map(|x| *x) avoids the panic codegen of unwrap().
                 for p in self.providers[..self.count].iter().filter_map(|x| *x) {
@@ -162,9 +169,9 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
                 w.s("]}}").nl();
             }
             "tools/call" => {
-                self.dispatch_tool_call(msg, req.id, &mut w);
+                self.dispatch_tool_call(msg, id, &mut w);
             }
-            _ => rpc_err(&mut w, req.id, -32601, "method not found"),
+            _ => rpc_err(&mut w, id, -32601, "method not found"),
         }
 
         // Drop a truncated response rather than ship malformed JSON: the
@@ -184,7 +191,7 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
     // Separate function so [0u8; OUT] is stack-allocated only on the tools/call path,
     // not in every handle() frame regardless of method.
     #[inline(never)]
-    fn dispatch_tool_call(&self, msg: &[u8], id: u64, w: &mut Writer) {
+    fn dispatch_tool_call(&self, msg: &[u8], id: &[u8], w: &mut Writer) {
         let params_raw = obj_get(msg, b"params").unwrap_or(b"{}");
 
         let Ok((tc, _)) = serde_json_core::from_slice::<ToolCallParams>(params_raw) else {
@@ -199,7 +206,7 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
 
         match self.find(tc.name) {
             Some(p) => {
-                w.s(r#"{"jsonrpc":"2.0","id":"#).u(id);
+                w.s(r#"{"jsonrpc":"2.0","id":"#).push(id);
                 match p.call(tc.name, args, &mut output) {
                     Ok(()) => {
                         let text = core::str::from_utf8(output.as_bytes()).unwrap_or("");
@@ -221,8 +228,8 @@ impl<'p, const N: usize, const OUT: usize> Default for Runtime<'p, N, OUT> {
     fn default() -> Self { Self::new() }
 }
 
-pub(crate) fn write_initialize(w: &mut Writer, id: u64) {
-    w.s(r#"{"jsonrpc":"2.0","id":"#).u(id)
+pub(crate) fn write_initialize(w: &mut Writer, id: &[u8]) {
+    w.s(r#"{"jsonrpc":"2.0","id":"#).push(id)
      .s(r#","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}"#)
      .nl();
 }
@@ -247,13 +254,19 @@ pub(crate) fn write_tool_size(name: &str, desc: &str) -> usize {
 
 #[cfg(feature = "gateway")]
 fn esc_len(s: &str) -> usize {
+    // Mirror Writer::esc exactly: short escapes cost 2 bytes, long-form
+    // \u00XX escapes cost 6, plain bytes cost 1.
     s.bytes()
-        .map(|b| if matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t') { 2 } else { 1 })
+        .map(|b| match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0C => 2,
+            0..=0x1F => 6,
+            _ => 1,
+        })
         .sum()
 }
 
-pub(crate) fn rpc_err(w: &mut Writer, id: u64, code: i32, msg: &str) {
-    w.s(r#"{"jsonrpc":"2.0","id":"#).u(id)
+pub(crate) fn rpc_err(w: &mut Writer, id: &[u8], code: i32, msg: &str) {
+    w.s(r#"{"jsonrpc":"2.0","id":"#).push(id)
      .s(r#","error":{"code":"#).i(code).s(r#","message":""#)
      .esc(msg).s(r#""}}"#).nl();
 }
@@ -424,38 +437,66 @@ impl<'a> Writer<'a> {
         let bytes = s.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
+            // JSON requires escaping `"`, `\`, and every byte in 0x00..=0x1F.
+            // Short forms exist for \n \r \t \b \f; everything else in that
+            // range needs the six-byte \u00XX form.
             let rel = bytes[i..]
                 .iter()
-                .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t'));
+                .position(|&b| matches!(b, b'"' | b'\\' | 0..=0x1F));
             let end = rel.map(|r| i + r).unwrap_or(bytes.len());
             if end > i {
                 self.push(&bytes[i..end]);
                 if self.truncated { return self; }
             }
             let Some(r) = rel else { break };
-            let second = match bytes[i + r] {
-                b'"'  => b'"',
-                b'\\' => b'\\',
-                b'\n' => b'n',
-                b'\r' => b'r',
-                b'\t' => b't',
-                _ => unreachable!(),
+            let byte = bytes[i + r];
+            let short = match byte {
+                b'"'  => Some(b'"'),
+                b'\\' => Some(b'\\'),
+                b'\n' => Some(b'n'),
+                b'\r' => Some(b'r'),
+                b'\t' => Some(b't'),
+                0x08  => Some(b'b'),
+                0x0C  => Some(b'f'),
+                _ => None,
             };
-            // Two-byte escape is all-or-nothing: an orphan `\` would be
-            // interpreted as starting an escape against whatever byte follows
-            // (often the closing `"`), corrupting the JSON.
-            if self.pos + 2 <= self.buf.len() {
-                self.buf[self.pos]     = b'\\';
-                self.buf[self.pos + 1] = second;
-                self.pos += 2;
-            } else {
-                self.truncated = true;
-                return self;
+            // Two-byte and six-byte escapes are both all-or-nothing: an orphan
+            // `\` would be interpreted as starting an escape against whatever
+            // byte follows (often the closing `"`), corrupting the JSON.
+            match short {
+                Some(c) => {
+                    if self.pos + 2 <= self.buf.len() {
+                        self.buf[self.pos]     = b'\\';
+                        self.buf[self.pos + 1] = c;
+                        self.pos += 2;
+                    } else {
+                        self.truncated = true;
+                        return self;
+                    }
+                }
+                None => {
+                    if self.pos + 6 <= self.buf.len() {
+                        self.buf[self.pos]     = b'\\';
+                        self.buf[self.pos + 1] = b'u';
+                        self.buf[self.pos + 2] = b'0';
+                        self.buf[self.pos + 3] = b'0';
+                        self.buf[self.pos + 4] = hex_nibble(byte >> 4);
+                        self.buf[self.pos + 5] = hex_nibble(byte & 0x0F);
+                        self.pos += 6;
+                    } else {
+                        self.truncated = true;
+                        return self;
+                    }
+                }
             }
             i = end + 1;
         }
         self
     }
+}
+
+const fn hex_nibble(n: u8) -> u8 {
+    if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
 fn fmt_u64(n: u64, buf: &mut [u8; 20]) -> &[u8] {
@@ -604,18 +645,21 @@ pub mod transport {
         pub fn serve(handler: impl Fn(&[u8], &mut [u8]) -> usize) {
             // Wrap stdin+stdout into a single Read+Write so the same
             // `run_connection` framing loop drives stdio identically to
-            // sockets. Buffered stdout is the reason `run_connection` flushes
-            // after each response (see comment there).
-            struct StdioStream {
-                stdin: std::io::Stdin,
-                stdout: std::io::Stdout,
+            // sockets. Locks are acquired once here rather than per-syscall:
+            // `Stdin::read` / `Stdout::write` reacquire the global lock on
+            // every call, which is real overhead on the typical
+            // subprocess-MCP path. Buffered stdout is the reason
+            // `run_connection` flushes after each response.
+            struct StdioStream<'a> {
+                stdin: std::io::StdinLock<'a>,
+                stdout: std::io::StdoutLock<'a>,
             }
-            impl Read for StdioStream {
+            impl Read for StdioStream<'_> {
                 fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                     self.stdin.read(buf)
                 }
             }
-            impl Write for StdioStream {
+            impl Write for StdioStream<'_> {
                 fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                     self.stdout.write(buf)
                 }
@@ -623,9 +667,11 @@ pub mod transport {
                     self.stdout.flush()
                 }
             }
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
             let stream = StdioStream {
-                stdin: std::io::stdin(),
-                stdout: std::io::stdout(),
+                stdin: stdin.lock(),
+                stdout: stdout.lock(),
             };
             run_connection(stream, &handler);
         }
@@ -757,6 +803,35 @@ mod tests {
     }
 
     #[test]
+    fn test_string_id_echoed_verbatim() {
+        // JSON-RPC 2.0 permits string ids; mcp-edge must echo the raw bytes.
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 512];
+        let n = rt.handle(
+            br#"{"jsonrpc":"2.0","id":"abc-42","method":"tools/list"}"#,
+            &mut out,
+        );
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.contains(r#""id":"abc-42""#), "{s}");
+    }
+
+    #[test]
+    fn test_null_id_echoed() {
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 512];
+        let n = rt.handle(
+            br#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#,
+            &mut out,
+        );
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.contains(r#""id":null"#), "{s}");
+    }
+
+    #[test]
     fn test_parse_error_response() {
         // Malformed JSON must produce a JSON-RPC parse-error reply with
         // id:null and code -32700, not a silent zero-byte drop.
@@ -834,6 +909,14 @@ mod tests {
         assert_eq!(run("a\\b"), "a\\\\b");
         assert_eq!(run("end\n"), "end\\n");
         assert_eq!(run("\rstart"), "\\rstart");
+        // Short forms for \b and \f.
+        assert_eq!(run("\x08"), "\\b");
+        assert_eq!(run("\x0c"), "\\f");
+        // Long form \u00XX for control bytes without a short form.
+        assert_eq!(run("\x01"), "\\u0001");
+        assert_eq!(run("\x1f"), "\\u001f");
+        // Mixed: plain text + control byte + plain text.
+        assert_eq!(run("ok\x07bell"), "ok\\u0007bell");
     }
 
     #[test]

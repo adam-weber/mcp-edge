@@ -20,9 +20,9 @@ send '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 echo ""
 
 echo "3. Read temperature:"
-send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temperature_read"}}'
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temp_read","arguments":{}}}'
 echo ""
 
 echo "4. Read humidity:"
-send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"humidity_read"}}'
+send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"humidity_read","arguments":{}}}'
 echo ""

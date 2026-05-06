@@ -8,7 +8,8 @@
 //! # Memory layout (on a 32-bit target)
 //!
 //! `Gateway<L, T, B, C>` struct size:
-//! - L × 109 bytes  — leaf socket paths (108 + 1 length byte each)
+//! - L × 109 bytes  — leaf addresses (108 + 1 length byte each; sized for
+//!   Linux `sun_path` but also stores TCP/TLS `host:port`)
 //! - T × 34 bytes   — routing table entries (32-byte name + 2 bytes indices)
 //! - B bytes        — cached tools-list JSON
 //! - 12 bytes       — three usize counters (4 bytes each on 32-bit)
@@ -31,7 +32,10 @@ use std::io::{Read, Write as IoWrite};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 
-const PATH_MAX: usize = 108; // UNIX_PATH_MAX
+// Sized for Linux's `sun_path` (UNIX_PATH_MAX = 108). The same buffer also
+// stores TCP/TLS `host:port` strings, which fit comfortably in 108 bytes for
+// realistic deployments.
+const LEAF_ADDR_MAX: usize = 108;
 const NAME_MAX: usize = 32;
 const INIT_MSG: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}\n";
 
@@ -106,6 +110,10 @@ pub(crate) fn parse_scheme(addr: &str) -> Scheme<'_> {
 /// kinds without trait objects or `Box`. `Read`/`Write` forwarders are
 /// `#[inline]` so the variant match collapses at every call site in
 /// `proxy_call` — single branch per syscall, no vtable.
+///
+/// `#[non_exhaustive]`: a `Tls` variant lands once the `tls` feature is wired
+/// up. Match externally with a `_` arm to stay forward-compatible.
+#[non_exhaustive]
 pub enum LeafConnection {
     Unix(UnixStream),
     Tcp(TcpStream),
@@ -164,18 +172,18 @@ impl Connector for MultiConnector {
 
 #[derive(Copy, Clone)]
 struct LeafAddr {
-    path: [u8; PATH_MAX],
+    addr: [u8; LEAF_ADDR_MAX],
     len: u8,
 }
 
 impl LeafAddr {
-    const EMPTY: Self = Self { path: [0u8; PATH_MAX], len: 0 };
+    const EMPTY: Self = Self { addr: [0u8; LEAF_ADDR_MAX], len: 0 };
 
     fn as_str(&self) -> &str {
         // SAFETY: the bytes were copied from a `&str` in `add_leaf`, so they
         // are valid UTF-8. Skipping validation avoids a per-call linear scan
-        // of the path on the hot tools/call path.
-        unsafe { core::str::from_utf8_unchecked(&self.path[..self.len as usize]) }
+        // of the address on the hot tools/call path.
+        unsafe { core::str::from_utf8_unchecked(&self.addr[..self.len as usize]) }
     }
 }
 
@@ -274,8 +282,8 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
     /// leaf — treat any error as fatal and abort startup rather than continuing.
     pub fn add_leaf(&mut self, path: &str) -> Result<(), &'static str> {
         if self.leaf_count >= L { return Err("leaf limit reached"); }
-        if path.is_empty() { return Err("leaf path is empty"); }
-        if path.len() > PATH_MAX { return Err("leaf path exceeds PATH_MAX bytes"); }
+        if path.is_empty() { return Err("leaf address is empty"); }
+        if path.len() > LEAF_ADDR_MAX { return Err("leaf address exceeds LEAF_ADDR_MAX bytes"); }
 
         // Discover tools before committing the leaf slot, so a failed
         // connection doesn't waste an index. Goes through the connector so
@@ -285,7 +293,13 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         let n = {
             let mut conn = self.connector.connect(path)?;
             conn.write_all(INIT_MSG).map_err(|_| "write failed")?;
-            read_line(&mut conn, &mut resp).ok_or("no initialize response")?;
+            // Validate the leaf accepted initialize before proceeding —
+            // otherwise we'd silently overwrite the error response with the
+            // tools/list reply and lose the failure signal.
+            let init_n = read_line(&mut conn, &mut resp).ok_or("no initialize response")?;
+            if obj_get(&resp[..init_n], b"error").is_some() {
+                return Err("leaf returned error to initialize");
+            }
 
             conn.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
                 .map_err(|_| "write failed")?;
@@ -296,11 +310,17 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         let tools_arr = obj_get(result, b"tools").ok_or("no tools in leaf response")?;
 
         // Commit the leaf slot only after a successful connection.
+        // Casts to u8 below: leaf_count < L <= 255 (gateway can't index more
+        // than 255 leaves anyway), and path.len() <= LEAF_ADDR_MAX = 108
+        // (checked above).
+        #[allow(clippy::cast_possible_truncation)]
         let leaf_idx = self.leaf_count as u8;
         let path_bytes = path.as_bytes();
-        // path.len() <= PATH_MAX checked above, so the copy fits exactly.
-        self.leaves[self.leaf_count].path[..path_bytes.len()].copy_from_slice(path_bytes);
-        self.leaves[self.leaf_count].len = path_bytes.len() as u8;
+        self.leaves[self.leaf_count].addr[..path_bytes.len()].copy_from_slice(path_bytes);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.leaves[self.leaf_count].len = path_bytes.len() as u8;
+        }
         self.leaf_count += 1;
 
         // Iterate `[{...},{...}]` without allocating.
@@ -345,14 +365,18 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         // Slot is already zeroed from Gateway::new(); write fields directly.
         let slot = &mut self.routes[self.route_count];
         slot.name[..name.len()].copy_from_slice(name.as_bytes());
-        slot.len = name.len() as u8;
+        // Cast to u8: name.len() <= NAME_MAX = 32 (checked above).
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            slot.len = name.len() as u8;
+        }
         slot.leaf = leaf;
         self.route_count += 1;
         Ok(())
     }
 
     fn append_tool_json(&mut self, name: &str, desc: &str) -> Result<(), &'static str> {
-        let comma = if self.tools_json_len > 0 { 1 } else { 0 };
+        let comma = usize::from(self.tools_json_len > 0);
         let needed = comma + write_tool_size(name, desc);
         if self.tools_json_len + needed > B {
             return Err("tools_json buffer (B) too small for combined tool list");
@@ -385,10 +409,12 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
             return w.pos;
         };
 
+        let id = obj_get(msg, b"id").unwrap_or(b"null");
+
         match req.method {
-            "initialize" => write_initialize(&mut w, req.id),
+            "initialize" => write_initialize(&mut w, id),
             "tools/list" => {
-                w.s(r#"{"jsonrpc":"2.0","id":"#).u(req.id).s(r#","result":{"tools":["#);
+                w.s(r#"{"jsonrpc":"2.0","id":"#).push(id).s(r#","result":{"tools":["#);
                 w.push(&self.tools_json[..self.tools_json_len]);
                 w.s("]}}").nl();
             }
@@ -397,7 +423,7 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
 
                 let Ok((tc, _)) = serde_json_core::from_slice::<crate::ToolCallParams>(params_raw)
                 else {
-                    rpc_err(&mut w, req.id, -32600, "bad params");
+                    rpc_err(&mut w, id, -32600, "bad params");
                     return w.pos;
                 };
 
@@ -407,15 +433,15 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
                     Some(idx) => {
                         let leaf_path = self.leaves[idx].as_str();
                         let start = w.pos;
-                        if let Err(e) = self.proxy_call(leaf_path, tc.name, args, req.id, &mut w) {
+                        if let Err(e) = self.proxy_call(leaf_path, tc.name, args, id, &mut w) {
                             w.pos = start;
-                            rpc_err(&mut w, req.id, -1, e);
+                            rpc_err(&mut w, id, -1, e);
                         }
                     }
-                    None => rpc_err(&mut w, req.id, -32601, "unknown tool"),
+                    None => rpc_err(&mut w, id, -32601, "unknown tool"),
                 }
             }
-            _ => rpc_err(&mut w, req.id, -32601, "method not found"),
+            _ => rpc_err(&mut w, id, -32601, "method not found"),
         }
 
         // See `Runtime::handle`: drop a truncated response instead of
@@ -432,7 +458,7 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         leaf_path: &str,
         tool: &str,
         args: &[u8],
-        req_id: u64,
+        req_id: &[u8],
         w: &mut Writer,
     ) -> Result<(), &'static str> {
         // Request is short: ~60 bytes fixed + tool name + args.
@@ -458,7 +484,7 @@ impl<const L: usize, const T: usize, const B: usize, C: Connector> Gateway<L, T,
         let rn = read_line(&mut conn, &mut resp_buf).ok_or("no response from leaf")?;
 
         let resp = &resp_buf[..rn];
-        w.s(r#"{"jsonrpc":"2.0","id":"#).u(req_id);
+        w.s(r#"{"jsonrpc":"2.0","id":"#).push(req_id);
 
         if let Some(res) = obj_get(resp, b"result") {
             w.s(r#","result":"#).push(res);
