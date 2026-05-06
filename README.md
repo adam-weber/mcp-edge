@@ -58,7 +58,22 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temp_read"
   | nc -U /tmp/mcp-edge.sock
 ```
 
-Any MCP-compatible agent can now discover and use your sensor.
+Try the gateway aggregating two single-tool leaves:
+
+```bash
+# Terminals 1 & 2: two leaves, each exposing one tool
+TOOL=temp     SOCK=/tmp/leaf1.sock cargo run --example sensor
+TOOL=humidity SOCK=/tmp/leaf2.sock cargo run --example sensor
+
+# Terminal 3: gateway
+cargo run --example gateway --features gateway
+
+# Terminal 4: list both tools through the gateway
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | nc -U /tmp/gateway.sock
+```
+
+Any MCP-compatible agent can now discover and use these tools.
 
 ## How It Works
 
@@ -101,31 +116,91 @@ The runtime parses JSON-RPC, dispatches `initialize`, `tools/list`, and `tools/c
 
 A single device exposing its own capabilities. An agent connects directly.
 
-*Example: a Raspberry Pi with sensors in a greenhouse — agents read temperature and humidity over its socket.*
+**Example: greenhouse monitor on a Raspberry Pi.** A Pi reads a DHT22 (temperature + humidity) and a capacitive soil-moisture probe. An agent on a phone or laptop reaches it over Tailscale and answers questions like *"should I water the tomatoes today?"* without you writing any prompt-handling code.
+
+```rust
+use core::fmt::Write;
+use mcp_edge::transport::UnixTransport;
+use mcp_edge::{Output, Provider, Runtime, Tool};
+
+struct Climate;
+impl Provider for Climate {
+    fn tools(&self) -> &[Tool] {
+        &[
+            Tool { name: "temp_c",   description: "Air temperature, °C" },
+            Tool { name: "humidity", description: "Relative humidity, %" },
+        ]
+    }
+    fn call(&self, tool: &str, _args: &[u8], out: &mut Output) -> Result<(), &'static str> {
+        let (t, h) = read_dht22().map_err(|_| "sensor read failed")?;
+        match tool {
+            "temp_c"   => write!(out, "{:.1}", t).unwrap(),
+            "humidity" => write!(out, "{:.0}", h).unwrap(),
+            _ => return Err("unknown tool"),
+        }
+        Ok(())
+    }
+}
+
+struct Soil;
+impl Provider for Soil {
+    fn tools(&self) -> &[Tool] {
+        &[Tool { name: "soil_moisture", description: "Soil moisture, % (0=dry, 100=wet)" }]
+    }
+    fn call(&self, _tool: &str, _args: &[u8], out: &mut Output) -> Result<(), &'static str> {
+        let m = read_moisture_adc().map_err(|_| "ADC read failed")?;
+        write!(out, "{:.0}", m).unwrap();
+        Ok(())
+    }
+}
+
+fn main() {
+    let climate = Climate;
+    let soil = Soil;
+    let mut rt: Runtime<'_, 2> = Runtime::new();
+    rt.register(&climate).unwrap();
+    rt.register(&soil).unwrap();
+    UnixTransport::new("/run/greenhouse.sock").serve(|m, o| rt.handle(m, o));
+}
+```
+
+`read_dht22` and `read_moisture_adc` are your hardware drivers — mcp-edge ships only the MCP protocol surface, not sensor code.
 
 ### Gateway
 
 A device that aggregates multiple leaves behind one socket. Routes each `tools/call` to the owning leaf and proxies the response back.
 
+**Example: workshop Pi with fault-isolated providers.** Running every provider in one process means a glitch in one (e.g., a relay driver that hangs on a serial timeout) takes down sensor reads. Splitting concerns into separate processes — each owning its own bus or actuator on its own Unix socket — contains failures, and systemd restarts each independently. A gateway recombines them so agents see one device.
+
+A workshop Pi runs four systemd services:
+
+| Service                    | Socket                     | Provides                            |
+|----------------------------|----------------------------|-------------------------------------|
+| `workshop-climate.service` | `/run/leaves/climate.sock` | `temp_c`, `humidity`, `dust_ppm`    |
+| `workshop-power.service`   | `/run/leaves/power.sock`   | `mains_w`, `solar_w`, `battery_pct` |
+| `workshop-cnc.service`     | `/run/leaves/cnc.sock`     | `cnc_state`, `spindle_rpm`          |
+| `workshop-gateway.service` | `/run/workshop.sock`       | (aggregates the three above)        |
+
+The gateway:
+
 ```rust
 use mcp_edge::transport::UnixTransport;
 use mcp_edge::Gateway;
 
-let mut gw: Gateway<2, 16> = Gateway::new();
-gw.add_leaf("/tmp/leaf1.sock").unwrap();
-gw.add_leaf("/tmp/leaf2.sock").unwrap();
-UnixTransport::new("/tmp/gateway.sock").serve(|msg, out| gw.handle(msg, out));
+fn main() {
+    let mut gw: Gateway<3, 16> = Gateway::new();
+    gw.add_leaf("/run/leaves/climate.sock").expect("climate leaf unavailable");
+    gw.add_leaf("/run/leaves/power.sock").expect("power leaf unavailable");
+    gw.add_leaf("/run/leaves/cnc.sock").expect("cnc leaf unavailable");
+    UnixTransport::new("/run/workshop.sock").serve(|m, o| gw.handle(m, o));
+}
 ```
 
-Run the demo (three terminals):
+An agent connects only to `/run/workshop.sock` and sees eight tools as one flat namespace. Asked *"is the CNC running and how much solar power are we generating?"* it calls `cnc_state` and `solar_w` — the gateway routes each to the right leaf and proxies the answer back. Agents never see the topology.
 
-```bash
-TOOL=temp     SOCK=/tmp/leaf1.sock cargo run --example sensor
-TOOL=humidity SOCK=/tmp/leaf2.sock cargo run --example sensor
-cargo run --example gateway --features gateway
-```
+If the CNC service crashes, calls to its tools return `{"error":{"code":-1,"message":"leaf connect failed"}}` and the other tools keep working. Tool discovery happens once at gateway startup, so when systemd restarts the CNC service, restart the gateway too if the tool list changed.
 
-The gateway opens a fresh connection per call (stateless). The MCP `initialize` handshake runs once per leaf at startup, never per call — so each `tools/call` is exactly one round trip.
+The gateway opens a fresh connection per call (stateless). The MCP `initialize` handshake runs once per leaf at startup, never per call — every `tools/call` is exactly one round trip.
 
 ## Resource Philosophy
 
