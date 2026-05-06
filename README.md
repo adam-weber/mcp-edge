@@ -1,38 +1,31 @@
 # mcp-edge
 
-A minimal MCP runtime with a layered, pluggable architecture. `no_std`-compatible core, zero heap, fits in tens of KB of RAM. The same primitives serve a sensor on a Pi and a multi-device gateway over the network; ambitious pieces (TLS, custom transports) layer on through opt-in features.
-
-## Getting Started
-
-### Install
-
-```bash
-cargo add mcp-edge
-```
-
-Optional features:
-
-- `std` (default) — enables `UnixTransport` and `TcpTransport`
-- `gateway` — enables `Gateway` for aggregating multiple leaves under one socket (requires `std`)
-- `tls` — reserves the `tls://` leaf-address scheme in `MultiConnector` (the rustls integration lands in a follow-up; today the surface compiles but `tls://` returns "tls connector not yet implemented")
-
-### Minimal Example
+A minimal Rust runtime for the [Model Context Protocol](https://modelcontextprotocol.io). All you implement is this:
 
 ```rust
+pub trait Provider {
+    fn tools(&self) -> &[Tool];
+    fn call(&self, tool: &str, args: &[u8], out: &mut Output) -> Result<(), &'static str>;
+}
+```
+
+Two functions — list your tools, run one. mcp-edge does the rest of the protocol.
+
+`no_std`-compatible core, zero heap, ~3.6 KB of resident state at default sizes. Small enough to run on a $5 microcontroller; composes into a multi-device gateway when one chip isn't enough.
+
+## A complete server
+
+```rust
+use mcp_edge::{Output, Provider, Runtime, Tool, transport::UnixTransport};
 use core::fmt::Write;
-use mcp_edge::transport::UnixTransport;
-use mcp_edge::{Output, Provider, Runtime, Tool};
 
 struct TempSensor;
-
 impl Provider for TempSensor {
     fn tools(&self) -> &[Tool] {
         &[Tool { name: "temp_read", description: "Read temperature in Celsius" }]
     }
-
-    fn call(&self, _tool: &str, _args: &[u8], out: &mut Output) -> Result<(), &'static str> {
-        // Replace with your actual sensor read.
-        write!(out, "22.5").unwrap();
+    fn call(&self, _: &str, _: &[u8], out: &mut Output) -> Result<(), &'static str> {
+        write!(out, "{:.1}", read_sensor()).unwrap();
         Ok(())
     }
 }
@@ -41,17 +34,22 @@ fn main() {
     let sensor = TempSensor;
     let mut rt: Runtime<'_, 1> = Runtime::new();
     rt.register(&sensor).unwrap();
-    UnixTransport::new("/tmp/mcp-edge.sock").serve(|msg, out| rt.handle(msg, out));
+    UnixTransport::new("/tmp/mcp-edge.sock").serve(|m, o| rt.handle(m, o));
 }
 ```
 
-### Test It
+That's the whole program. Cross-machine? Swap one line:
+
+```rust
+TcpTransport::new("0.0.0.0:9000").serve(|m, o| rt.handle(m, o));
+```
+
+## Try it
 
 ```bash
-# Terminal 1: run the example sensor
-cargo run --example sensor
+cargo add mcp-edge
+cargo run --example sensor &
 
-# Terminal 2: list tools, then call one
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | nc -U /tmp/mcp-edge.sock
 
@@ -59,183 +57,50 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temp_read"
   | nc -U /tmp/mcp-edge.sock
 ```
 
-Cross-machine? Swap one line — same handler, different transport:
+## Aggregating multiple devices
+
+When you outgrow one process — fault isolation across systemd services, multiple ECUs on a vehicle bus, sensors scattered across a workshop — the same primitives compose into a `Gateway`. The default `MultiConnector` dispatches each leaf by URL scheme, so one gateway can mix Unix, TCP, and (planned) TLS:
 
 ```rust
-use mcp_edge::transport::TcpTransport;
-TcpTransport::new("0.0.0.0:9000").serve(|m, o| rt.handle(m, o));
-```
-
-Try the gateway aggregating two single-tool leaves:
-
-```bash
-# Terminals 1 & 2: two leaves, each exposing one tool
-TOOL=temp     SOCK=/tmp/leaf1.sock cargo run --example sensor
-TOOL=humidity SOCK=/tmp/leaf2.sock cargo run --example sensor
-
-# Terminal 3: gateway
-cargo run --example gateway --features gateway
-
-# Terminal 4: list both tools through the gateway
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  | nc -U /tmp/gateway.sock
-```
-
-Any MCP-compatible agent can now discover and use these tools.
-
-## How It Works
-
-mcp-edge is a library, not a framework. Your program:
-
-1. Constructs a `Runtime<N, OUT>` — `N` is the max provider count, `OUT` is the max bytes a single tool result may produce.
-2. Registers providers (each exposes one or more tools).
-3. Picks a transport (`UnixTransport` for local, `TcpTransport` for cross-machine) and calls `.serve(|msg, out| rt.handle(msg, out))`.
-
-The runtime parses JSON-RPC, dispatches `initialize`, `tools/list`, and `tools/call`, and writes replies into a caller-provided buffer. All sizes are const-generic, so the entire runtime lives on the stack — no allocator required. Transports and gateway connectors are trait-shaped, so swapping in TLS, an `embedded-nal` stack, or a custom protocol doesn't touch the runtime.
-
-```
-┌───────────────────────────────────────────────┐
-│  Your device                                  │
-│                                               │
-│  ┌───────────────────────────────────────┐    │
-│  │  mcp-edge runtime                     │    │
-│  │                                       │    │
-│  │  ┌─────────────┐  ┌─────────────┐     │    │
-│  │  │ Provider A  │  │ Provider B  │     │    │
-│  │  │ (sensors)   │  │ (actuators) │     │    │
-│  │  └──────┬──────┘  └──────┬──────┘     │    │
-│  │         │                │            │    │
-│  │         └────────┬───────┘            │    │
-│  │                  │                    │    │
-│  │         ┌────────▼────────┐           │    │
-│  │         │    Transport    │           │    │
-│  │         │  (Unix / TCP)   │           │    │
-│  │         └────────┬────────┘           │    │
-│  └──────────────────│────────────────────┘    │
-│                     │                         │
-└─────────────────────│─────────────────────────┘
-                      │
-                      ▼
-                    Agent
-```
-
-## Deployment Patterns
-
-### Leaf
-
-A single device exposing its own capabilities. An agent connects directly.
-
-**Example: greenhouse monitor on a Raspberry Pi.** A Pi reads a DHT22 (temperature + humidity) and a capacitive soil-moisture probe. An agent on a phone or laptop reaches it over Tailscale and answers questions like *"should I water the tomatoes today?"* without you writing any prompt-handling code.
-
-```rust
-use core::fmt::Write;
-use mcp_edge::transport::UnixTransport;
-use mcp_edge::{Output, Provider, Runtime, Tool};
-
-struct Climate;
-impl Provider for Climate {
-    fn tools(&self) -> &[Tool] {
-        &[
-            Tool { name: "temp_c",   description: "Air temperature, °C" },
-            Tool { name: "humidity", description: "Relative humidity, %" },
-        ]
-    }
-    fn call(&self, tool: &str, _args: &[u8], out: &mut Output) -> Result<(), &'static str> {
-        let (t, h) = read_dht22().map_err(|_| "sensor read failed")?;
-        match tool {
-            "temp_c"   => write!(out, "{:.1}", t).unwrap(),
-            "humidity" => write!(out, "{:.0}", h).unwrap(),
-            _ => return Err("unknown tool"),
-        }
-        Ok(())
-    }
-}
-
-struct Soil;
-impl Provider for Soil {
-    fn tools(&self) -> &[Tool] {
-        &[Tool { name: "soil_moisture", description: "Soil moisture, % (0=dry, 100=wet)" }]
-    }
-    fn call(&self, _tool: &str, _args: &[u8], out: &mut Output) -> Result<(), &'static str> {
-        let m = read_moisture_adc().map_err(|_| "ADC read failed")?;
-        write!(out, "{:.0}", m).unwrap();
-        Ok(())
-    }
-}
-
-fn main() {
-    let climate = Climate;
-    let soil = Soil;
-    let mut rt: Runtime<'_, 2> = Runtime::new();
-    rt.register(&climate).unwrap();
-    rt.register(&soil).unwrap();
-    UnixTransport::new("/run/greenhouse.sock").serve(|m, o| rt.handle(m, o));
-}
-```
-
-`read_dht22` and `read_moisture_adc` are your hardware drivers — mcp-edge ships only the MCP protocol surface, not sensor code.
-
-### Gateway
-
-A device that aggregates multiple leaves behind one socket. Routes each `tools/call` to the owning leaf and proxies the response back.
-
-**Example: workshop Pi with fault-isolated providers.** Running every provider in one process means a glitch in one (e.g., a relay driver that hangs on a serial timeout) takes down sensor reads. Splitting concerns into separate processes — each owning its own bus or actuator on its own Unix socket — contains failures, and systemd restarts each independently. A gateway recombines them so agents see one device.
-
-A workshop Pi runs four systemd services:
-
-| Service                    | Socket                     | Provides                            |
-|----------------------------|----------------------------|-------------------------------------|
-| `workshop-climate.service` | `/run/leaves/climate.sock` | `temp_c`, `humidity`, `dust_ppm`    |
-| `workshop-power.service`   | `/run/leaves/power.sock`   | `mains_w`, `solar_w`, `battery_pct` |
-| `workshop-cnc.service`     | `/run/leaves/cnc.sock`     | `cnc_state`, `spindle_rpm`          |
-| `workshop-gateway.service` | `/run/workshop.sock`       | (aggregates the three above)        |
-
-The gateway:
-
-```rust
-use mcp_edge::transport::UnixTransport;
-use mcp_edge::Gateway;
-
-fn main() {
-    let mut gw: Gateway<3, 16> = Gateway::new();
-    gw.add_leaf("/run/leaves/climate.sock").expect("climate leaf unavailable");
-    gw.add_leaf("/run/leaves/power.sock").expect("power leaf unavailable");
-    gw.add_leaf("/run/leaves/cnc.sock").expect("cnc leaf unavailable");
-    UnixTransport::new("/run/workshop.sock").serve(|m, o| gw.handle(m, o));
-}
-```
-
-The default `Gateway` uses `MultiConnector`, which dispatches on a URL prefix in each `add_leaf` address — so the same gateway can mix transports:
-
-```rust
+let mut gw: Gateway<3, 16> = Gateway::new();
 gw.add_leaf("/run/leaves/climate.sock").unwrap();    // bare path → Unix
-gw.add_leaf("unix:///run/leaves/power.sock").unwrap(); // explicit Unix
-gw.add_leaf("tcp://10.0.0.5:9000").unwrap();         // remote leaf over TCP
-gw.add_leaf("tls://factory.local:9001").unwrap();    // remote leaf over TLS (requires `tls` feature)
+gw.add_leaf("tcp://10.0.0.5:9000").unwrap();         // remote, TCP
+gw.add_leaf("tls://factory.local:9001").unwrap();    // requires `tls` feature
+UnixTransport::new("/run/aggregator.sock").serve(|m, o| gw.handle(m, o));
 ```
 
-For a leaner, Unix-only build, pin the connector explicitly:
+Agents see one flat namespace. The gateway routes per tool name, opens a fresh stateless connection per call, and proxies the response back. See [`examples/gateway.rs`](examples/gateway.rs) for a runnable demo.
 
-```rust
-use mcp_edge::gateway::UnixConnector;
-let mut gw: Gateway<3, 16, 2048, UnixConnector> = Gateway::new();
+## Architecture
+
+Three trait-shaped boundaries; nothing else is load-bearing.
+
+- **`Provider`** — what the device exposes. Backed by whatever you can reach: GPIO, I2C, CAN, LIN, UDS, software state.
+- **`Transport`** — how agents reach you. `UnixTransport`, `TcpTransport` today. TLS and `embedded-nal` (for bare-metal MCUs) layer on as features or sibling crates.
+- **`Connector`** — how a `Gateway` reaches each leaf. `UnixConnector`, `TcpConnector`, URL-scheme-dispatching `MultiConnector` today. Future: `TlsConnector`, SOME/IP-SD for automotive zonal controllers.
+
+Default connectors and transports are zero-sized — heavyweight integrations live behind feature flags so they cost nothing if you don't opt in.
+
+## Resource budgets (defaults)
+
+- `Runtime<'_, 8, 512>`: ~136 bytes resident; peak `OUT` bytes (= 512) of stack on `tools/call`, ~80 bytes elsewhere.
+- `Gateway<4, 32, 2048>`: ~3.6 KB resident; 1.3 KB per-call stack peak.
+- All sizes are const-generic. Exceeding them errors at startup — never a silent truncation at runtime.
+
+## Where it doesn't fit
+
+- **Cloud / production MCP servers** — use [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) (official Anthropic SDK). Async, full feature surface, well-maintained.
+- **Enterprise gateways** (auth, observability, Docker, K8s) — use MetaMCP, Kong AI Gateway, IBM ContextForge. mcp-edge is a library, not an orchestrator.
+- **On-device LLM inference** — mcp-edge sits *below* the model. The smallest useful SLMs need ~600 MB RAM (Pi 5 territory). On the MCU tier, the LLM lives elsewhere; mcp-edge exposes tools to whatever calls in.
+
+## Features
+
+- `std` (default) — `UnixTransport` and `TcpTransport`
+- `gateway` — `Gateway` for aggregating leaves (requires `std`)
+- `tls` — reserves the `tls://` URL scheme in `MultiConnector` (rustls integration lands in a follow-up)
+
+For `no_std` builds:
+
+```toml
+mcp-edge = { version = "0.1", default-features = false }
 ```
-
-An agent connects only to `/run/workshop.sock` and sees eight tools as one flat namespace. Asked *"is the CNC running and how much solar power are we generating?"* it calls `cnc_state` and `solar_w` — the gateway routes each to the right leaf and proxies the answer back. Agents never see the topology.
-
-If the CNC service crashes, calls to its tools return `{"error":{"code":-1,"message":"leaf connect failed"}}` and the other tools keep working. Tool discovery happens once at gateway startup, so when systemd restarts the CNC service, restart the gateway too if the tool list changed.
-
-The gateway opens a fresh connection per call (stateless). The MCP `initialize` handshake runs once per leaf at startup, never per call — every `tools/call` is exactly one round trip.
-
-## Resource Philosophy
-
-Edge devices have constraints. mcp-edge respects them.
-
-- **Zero heap.** No `Vec`, `String`, `Box`, or `Arc`. All storage is in fixed arrays sized by const generics.
-- **You declare the limits.** Provider count `N`, tool-result size `OUT`, leaf count `L`, route table size `T`, gateway tools-list buffer `B` — all compile-time. Exceeding them returns an error at startup, not a silent truncation at runtime.
-- **Stack budgets.** A default `Runtime<'_, 8, 512>` peaks around `OUT` bytes of stack on the `tools/call` path and ~80 bytes on every other path. A default `Gateway<4, 32, 2048>` is ~3.6 KB resident with a ~1.3 KB per-call stack peak.
-- **Pluggable, not bloated.** `Transport` (Unix/TCP, TLS planned) and `Connector` (how the gateway reaches each leaf) are trait boundaries. Default impls are zero-sized — heavyweight integrations live behind feature flags or sibling crates.
-- **`no_std` compatible.** The core runtime builds without `std`. Disable default features for `no_std` targets:
-  ```toml
-  mcp-edge = { version = "0.1", default-features = false }
-  ```
