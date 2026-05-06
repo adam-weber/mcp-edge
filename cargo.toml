@@ -5,5 +5,16 @@ edition = "2021"
 description = "Minimal MCP runtime for resource-constrained devices"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
-#
+# No dependencies. Zero heap allocation in the core.
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+name = "mcp_edge"
+path = "src/lib.rs"
+
+[[example]]
+name = "sensor"
+required-features = ["std"]
