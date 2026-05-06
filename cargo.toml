@@ -5,11 +5,14 @@ edition = "2021"
 description = "Minimal MCP runtime for resource-constrained devices"
 license = "MIT OR Apache-2.0"
 
-# No dependencies. Zero heap allocation in the core.
-
 [features]
 default = ["std"]
 std = []
+gateway = ["std"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.6", default-features = false }
 
 [lib]
 name = "mcp_edge"
@@ -18,3 +21,7 @@ path = "src/lib.rs"
 [[example]]
 name = "sensor"
 required-features = ["std"]
+
+[[example]]
+name = "gateway"
+required-features = ["gateway"]
