@@ -65,9 +65,10 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temp_read"
 When you outgrow one process — fault isolation across systemd services, multiple ECUs on a vehicle bus, sensors scattered across a workshop — the same primitives compose into a `Gateway`. The default `MultiConnector` dispatches each leaf by URL scheme, so one gateway can mix Unix, TCP, and (planned) TLS:
 
 ```rust
-let mut gw: Gateway<3, 16> = Gateway::new();
+let mut gw: Gateway<4, 16> = Gateway::new();
 gw.add_leaf("/run/leaves/climate.sock").unwrap();    // bare path → Unix
 gw.add_leaf("tcp://10.0.0.5:9000").unwrap();         // remote, TCP
+gw.add_leaf("udp://10.0.0.6:9000").unwrap();         // requires `udp` feature
 gw.add_leaf("tls://factory.local:9001").unwrap();    // requires `tls` feature
 UnixTransport::new("/run/aggregator.sock").serve(|m, o| gw.handle(m, o));
 ```
@@ -79,8 +80,8 @@ Agents see one flat namespace. The gateway routes per tool name, opens a fresh s
 Three trait-shaped boundaries; nothing else is load-bearing.
 
 - **`Provider`** — what the device exposes. Backed by whatever you can reach: GPIO, I2C, CAN, LIN, UDS, software state.
-- **`Transport`** — how agents reach you. `UnixTransport`, `TcpTransport` today. TLS and `embedded-nal` (for bare-metal MCUs) layer on as features or sibling crates.
-- **`Connector`** — how a `Gateway` reaches each leaf. `UnixConnector`, `TcpConnector`, URL-scheme-dispatching `MultiConnector` today. Future: `TlsConnector`, SOME/IP-SD for automotive zonal controllers.
+- **`Transport`** — how agents reach you. `UnixTransport`, `TcpTransport`, `UdpTransport` today. TLS and `embedded-nal` (for bare-metal MCUs) layer on as features or sibling crates.
+- **`Connector`** — how a `Gateway` reaches each leaf. `UnixConnector`, `TcpConnector`, `UdpConnector`, URL-scheme-dispatching `MultiConnector` today. Future: `TlsConnector`, SOME/IP-SD for automotive zonal controllers.
 
 Default connectors and transports are zero-sized — heavyweight integrations live behind feature flags so they cost nothing if you don't opt in.
 
@@ -100,6 +101,7 @@ Default connectors and transports are zero-sized — heavyweight integrations li
 
 - `std` (default) — `UnixTransport` and `TcpTransport`
 - `gateway` — `Gateway` for aggregating leaves (requires `std`)
+- `udp` — `UdpTransport` and `UdpConnector` (datagram framing, one request → one reply)
 - `tls` — reserves the `tls://` URL scheme in `MultiConnector` (rustls integration lands in a follow-up)
 
 For `no_std` builds:

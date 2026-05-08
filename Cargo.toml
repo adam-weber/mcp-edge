@@ -13,10 +13,11 @@ gateway = ["std"]
 # integration lands in a follow-up PR; today the surface compiles but the
 # tls:// arm returns "tls connector not yet implemented".
 tls = ["std"]
+# `udp` enables the `udp://` URL scheme: UdpConnector for the gateway and
+# UdpTransport for leaves/servers. Datagram-framed; one request, one reply.
+udp = ["std"]
 
 [dependencies]
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde-json-core = { version = "0.6", default-features = false }
 
 [lib]
 name = "mcp_edge"
@@ -37,3 +38,29 @@ required-features = ["std"]
 [[example]]
 name = "gateway"
 required-features = ["gateway"]
+
+[[example]]
+name = "bench"
+required-features = ["gateway"]
+
+# A "benchmarks" profile that swaps `opt-level = "z"` (size) for `opt-level = 3`
+# (speed). The default `release` profile is tuned for embedded binary size,
+# which costs a few percent on hot paths — not what we want when measuring
+# raw throughput. Run with `cargo run --profile bench-fast --example bench
+# --features gateway`.
+[profile.bench-fast]
+inherits = "release"
+opt-level = 3
+
+# Tuned for minimum binary size — `panic = "abort"` drops unwind tables and
+# the formatter pulled in by panic-message generation; `lto`/`codegen-units`
+# let the linker collapse cross-crate code paths; `opt-level = "z"` favors
+# size over speed (typically a few percent slower for ~10–20% smaller text).
+# Embedded users SHOULD mirror these in their own binary's Cargo.toml — these
+# settings only apply to mcp-edge's own `cargo build --release` (examples/tests).
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true

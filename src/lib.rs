@@ -38,8 +38,6 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use serde::Deserialize;
-
 // ---------------------------------------------------------------------------
 // Output — wraps a caller-provided buffer, implements fmt::Write
 // ---------------------------------------------------------------------------
@@ -93,21 +91,118 @@ pub trait Provider {
 }
 
 // ---------------------------------------------------------------------------
-// Serde structs — serde-json-core parses id / method / tool name
+// JSON helpers — id, method, and tool name are all extracted via obj_get
+// directly. The runtime never deserializes JSON into typed structs, which
+// is what lets us drop serde + serde-json-core entirely.
+//
+// JSON-RPC `id` is extracted as raw bytes (the spec permits string|number|null)
+// and echoed verbatim in the response. Method and tool-name keys are matched
+// against quoted-byte literals (e.g. `b"\"initialize\""`), avoiding a
+// per-message string-decode pass. Tool names with non-trivial JSON escapes
+// would not match — fine in practice, since names are short identifiers.
 // ---------------------------------------------------------------------------
 
-// JSON-RPC `id` is intentionally absent from this struct: the spec permits
-// `string | number | null`, so we extract it as raw bytes via `obj_get` and
-// echo it verbatim into the response. That keeps the runtime type-agnostic
-// without dragging in a heap-allocating Value type.
-#[derive(Deserialize)]
-pub(crate) struct Req<'a> {
-    pub(crate) method: &'a str,
+/// Strip the outer `"` from a JSON-string value (as returned by `obj_get`).
+/// Returns the inner bytes verbatim — does not decode `\u00XX` / `\n` / etc.
+/// Adequate for short identifiers (method names, tool names); unsuitable
+/// for arbitrary text where escape decoding matters.
+#[inline]
+pub(crate) fn unquote(b: &[u8]) -> Option<&[u8]> {
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        Some(&b[1..b.len() - 1])
+    } else {
+        None
+    }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct ToolCallParams<'a> {
-    pub(crate) name: &'a str,
+/// Walk a JSON object once, calling `on_pair(key_bytes, value_bytes)` for
+/// every member. This is the multi-key complement to `obj_get`: when a
+/// caller needs three or four fields from the same object, one walk through
+/// the bytes is dramatically cheaper than calling `obj_get` four times
+/// (which restarts the linear scan each call).
+///
+/// Both `key_bytes` and `value_bytes` borrow from `obj`; `value_bytes`
+/// includes the surrounding `"` for string values, the surrounding `{}`
+/// for objects, etc. — same shape as `obj_get`'s return.
+///
+/// Stops silently on malformed input (e.g. mid-value EOF). The closure is
+/// invoked for every well-formed pair seen up to that point — callers must
+/// tolerate partial data rather than rely on "all-or-nothing" parsing.
+#[inline]
+pub(crate) fn walk_obj_for<'a, F: FnMut(&'a [u8], &'a [u8])>(obj: &'a [u8], mut on_pair: F) {
+    let mut p = sp(obj, 0);
+    if obj.get(p) != Some(&b'{') { return; }
+    p += 1;
+    loop {
+        p = sp(obj, p);
+        match obj.get(p) {
+            Some(b'}') | None => return,
+            Some(b'"') => {}
+            _ => return,
+        }
+        p += 1;
+        let k0 = p;
+        if eat_str(obj, &mut p).is_none() { return; }
+        let k1 = p - 1;
+        p = sp(obj, p);
+        if obj.get(p) != Some(&b':') { return; }
+        p += 1;
+        p = sp(obj, p);
+        let v0 = p;
+        if skip_val(obj, &mut p).is_none() { return; }
+        let v1 = p;
+        on_pair(&obj[k0..k1], &obj[v0..v1]);
+        p = sp(obj, p);
+        if obj.get(p) == Some(&b',') { p += 1; }
+    }
+}
+
+/// Classification of an inbound JSON-RPC frame, used by both `Runtime::handle`
+/// and `Gateway::handle` to enforce the spec's three response cases:
+///
+/// - `ParseError`: input isn't a JSON object → respond with id:null + -32700.
+/// - `Notification`: valid JSON object with no `id` field → MUST NOT respond.
+/// - `Request`: valid JSON object with an `id` (including explicit `null`).
+///   `method` may be empty if the field is missing — dispatchers fall through
+///   to `-32601 method not found` in that case. `params` is `None` when
+///   absent, which the dispatchers treat as `{}`.
+///
+/// `classify` does a single walk through the message bytes. Callers used to
+/// chain three `obj_get` calls (id, method, params) — `walk_obj_for` lets us
+/// capture all three in one linear scan, which is meaningful CPU on a small
+/// MCU where every JSON pass is paid for in cycles.
+pub(crate) enum Msg<'a> {
+    ParseError,
+    Notification,
+    Request {
+        id: &'a [u8],
+        method: &'a [u8],
+        params: Option<&'a [u8]>,
+    },
+}
+
+#[inline]
+pub(crate) fn classify(msg: &[u8]) -> Msg<'_> {
+    // Reject anything that isn't a JSON object outright. Per JSON-RPC 2.0,
+    // a parse error is the only case where we respond despite not knowing
+    // the request id (id:null).
+    let p = sp(msg, 0);
+    if msg.get(p) != Some(&b'{') {
+        return Msg::ParseError;
+    }
+    let mut id: Option<&[u8]> = None;
+    let mut method: Option<&[u8]> = None;
+    let mut params: Option<&[u8]> = None;
+    walk_obj_for(msg, |k, v| match k {
+        b"id" => id = Some(v),
+        b"method" => method = Some(v),
+        b"params" => params = Some(v),
+        _ => {}
+    });
+    // Absence of `id` is the canonical "this is a notification" signal —
+    // including for malformed/incomplete frames that lacked closing braces.
+    let Some(id) = id else { return Msg::Notification; };
+    Msg::Request { id, method: method.unwrap_or(b""), params }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,69 +215,67 @@ pub(crate) struct ToolCallParams<'a> {
 /// - `OUT` — max bytes a single tool result may produce
 pub struct Runtime<'p, const N: usize = 8, const OUT: usize = 512> {
     providers: [Option<&'p dyn Provider>; N],
-    count: usize,
 }
 
 impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
-    pub fn new() -> Self { Self { providers: [None; N], count: 0 } }
+    pub fn new() -> Self { Self { providers: [None; N] } }
 
     /// Register a provider. Returns `Err` if more than `N` providers have been
     /// registered, matching `Gateway::add_leaf`'s error-returning shape so
     /// callers can choose how to react (typically `.unwrap()` at startup).
     pub fn register(&mut self, p: &'p dyn Provider) -> Result<(), &'static str> {
-        if self.count >= N { return Err("provider limit (N) reached"); }
-        self.providers[self.count] = Some(p);
-        self.count += 1;
+        let slot = self.providers.iter_mut().find(|s| s.is_none())
+            .ok_or("provider limit (N) reached")?;
+        *slot = Some(p);
         Ok(())
     }
 
     /// Dispatch one newline-terminated JSON-RPC message.
     /// Writes a newline-terminated response into `out`. Returns bytes written.
+    ///
+    /// Returns 0 for notifications (per JSON-RPC 2.0, a request with no `id`
+    /// field is a notification and the server MUST NOT respond) and for
+    /// truncated responses (callers should not forward malformed JSON).
     pub fn handle(&self, msg: &[u8], out: &mut [u8]) -> usize {
-        let mut w = Writer::new(out);
+        match classify(msg) {
+            Msg::ParseError => write_parse_error(out),
+            // A notification (no `id`) is processed for side effects but
+            // produces no response. mcp-edge has no side-effecting
+            // notifications today, so we simply drop them.
+            Msg::Notification => 0,
+            Msg::Request { id, method, params } => {
+                let mut w = Writer::new(out);
+                self.dispatch(method, id, params, &mut w);
+                if w.truncated { 0 } else { w.pos }
+            }
+        }
+    }
 
-        let Ok((req, _)) = serde_json_core::from_slice::<Req>(msg) else {
-            // JSON-RPC 2.0: parse error → respond with id:null and code -32700,
-            // so the client gets a clear error instead of an idle connection.
-            w.s(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#).nl();
-            if w.truncated { return 0; }
-            return w.pos;
-        };
-
-        // Echo the id raw — JSON-RPC permits string|number|null, and we don't
-        // need to interpret it.
-        let id = obj_get(msg, b"id").unwrap_or(b"null");
-
-        match req.method {
-            "initialize" => write_initialize(&mut w, id),
-            "tools/list" => {
+    fn dispatch(&self, method: &[u8], id: &[u8], params: Option<&[u8]>, w: &mut Writer) {
+        // Match against quoted bytes — saves a string-decode pass per message.
+        match method {
+            br#""initialize""# => write_initialize(w, id),
+            br#""tools/list""# => {
                 w.s(r#"{"jsonrpc":"2.0","id":"#).push(id).s(r#","result":{"tools":["#);
                 let mut first = true;
-                // filter_map(|x| *x) avoids the panic codegen of unwrap().
-                for p in self.providers[..self.count].iter().filter_map(|x| *x) {
+                for p in self.providers.iter().filter_map(|x| *x) {
                     for t in p.tools() {
                         if !first { w.s(","); }
                         first = false;
-                        write_tool(&mut w, t.name, t.description);
+                        write_tool(w, t.name, t.description);
                     }
                 }
                 w.s("]}}").nl();
             }
-            "tools/call" => {
-                self.dispatch_tool_call(msg, id, &mut w);
+            br#""tools/call""# => {
+                self.dispatch_tools_call(params, id, w);
             }
-            _ => rpc_err(&mut w, id, -32601, "method not found"),
+            _ => rpc_err(w, id, -32601, "method not found"),
         }
-
-        // Drop a truncated response rather than ship malformed JSON: the
-        // client will see a closed/idle reply, which is louder and clearer
-        // than mysterious parse errors on a chopped-off message.
-        if w.truncated { return 0; }
-        w.pos
     }
 
     fn find(&self, tool: &str) -> Option<&dyn Provider> {
-        self.providers[..self.count]
+        self.providers
             .iter()
             .filter_map(|x| *x)
             .find(|p| p.tools().iter().any(|t| t.name == tool))
@@ -191,23 +284,36 @@ impl<'p, const N: usize, const OUT: usize> Runtime<'p, N, OUT> {
     // Separate function so [0u8; OUT] is stack-allocated only on the tools/call path,
     // not in every handle() frame regardless of method.
     #[inline(never)]
-    fn dispatch_tool_call(&self, msg: &[u8], id: &[u8], w: &mut Writer) {
-        let params_raw = obj_get(msg, b"params").unwrap_or(b"{}");
-
-        let Ok((tc, _)) = serde_json_core::from_slice::<ToolCallParams>(params_raw) else {
+    fn dispatch_tools_call(&self, params: Option<&[u8]>, id: &[u8], w: &mut Writer) {
+        // Walk params once: pull both `name` and `arguments` in a single
+        // linear scan instead of two `obj_get` calls. For a typical 80-byte
+        // params object this halves the bytes scanned per tools/call.
+        let mut name_q: Option<&[u8]> = None;
+        let mut args: Option<&[u8]> = None;
+        if let Some(p) = params {
+            walk_obj_for(p, |k, v| match k {
+                b"name" => name_q = Some(v),
+                b"arguments" => args = Some(v),
+                _ => {}
+            });
+        }
+        let Some(name_q) = name_q else {
             rpc_err(w, id, -32600, "bad params");
             return;
         };
-
-        let args = obj_get(params_raw, b"arguments").unwrap_or(b"{}");
+        let Some(name) = unquote(name_q).and_then(|b| core::str::from_utf8(b).ok()) else {
+            rpc_err(w, id, -32600, "bad params");
+            return;
+        };
+        let args = args.unwrap_or(b"{}");
 
         let mut tool_out = [0u8; OUT];
         let mut output = Output::new(&mut tool_out);
 
-        match self.find(tc.name) {
+        match self.find(name) {
             Some(p) => {
                 w.s(r#"{"jsonrpc":"2.0","id":"#).push(id);
-                match p.call(tc.name, args, &mut output) {
+                match p.call(name, args, &mut output) {
                     Ok(()) => {
                         let text = core::str::from_utf8(output.as_bytes()).unwrap_or("");
                         w.s(r#","result":{"content":[{"type":"text","text":""#)
@@ -228,11 +334,41 @@ impl<'p, const N: usize, const OUT: usize> Default for Runtime<'p, N, OUT> {
     fn default() -> Self { Self::new() }
 }
 
+/// JSON-RPC 2.0 parse-error reply (id:null, code -32700). Returns the
+/// number of bytes written; 0 if `out` was too small to hold the response,
+/// in which case the caller drops the message instead of shipping a
+/// truncated frame.
+#[inline]
+pub(crate) fn write_parse_error(out: &mut [u8]) -> usize {
+    let mut w = Writer::new(out);
+    w.s(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#).nl();
+    if w.truncated { 0 } else { w.pos }
+}
+
+/// `initialize` reply for the local `Runtime`. Declares only that tools exist
+/// (`capabilities: {tools: {}}`) — Runtime cannot push `list_changed` because
+/// its provider set is `'static` and registered before `serve` runs.
 pub(crate) fn write_initialize(w: &mut Writer, id: &[u8]) {
     w.s(r#"{"jsonrpc":"2.0","id":"#).push(id)
      .s(r#","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}"#)
      .nl();
 }
+
+/// `initialize` reply for `Gateway`. Declares `tools.listChanged: true` so
+/// clients know the gateway will push `notifications/tools/list_changed`
+/// when leaves are added or removed at runtime.
+#[cfg(feature = "gateway")]
+pub(crate) fn write_initialize_gateway(w: &mut Writer, id: &[u8]) {
+    w.s(r#"{"jsonrpc":"2.0","id":"#).push(id)
+     .s(r#","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}}}}"#)
+     .nl();
+}
+
+/// JSON-RPC notification frame the gateway broadcasts when its tool set
+/// changes. Newline-terminated to match the rest of the wire protocol.
+#[cfg(feature = "gateway")]
+pub(crate) const TOOLS_LIST_CHANGED_NOTIFY: &[u8] =
+    b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n";
 
 pub(crate) fn write_tool(w: &mut Writer, name: &str, desc: &str) {
     w.s(r#"{"name":""#).s(name)
@@ -240,29 +376,25 @@ pub(crate) fn write_tool(w: &mut Writer, name: &str, desc: &str) {
      .s(r#"","inputSchema":{"type":"object"}}"#);
 }
 
-/// Exact byte count `write_tool` will produce for `(name, desc)`. Used by the
-/// gateway to pre-flight whether a tool entry will fit in its tools-list cache
-/// (so we can return an error at startup instead of silently truncating).
+/// Constant overhead `write_tool_raw` adds around `(name, desc_raw)` in bytes.
+/// Used by the gateway to pre-flight tool-list cache writes.
+//
+//   {"name":"NAME","description":"DESC","inputSchema":{"type":"object"}}
+//   ^^^^^^^^^      ^^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//   9              17                   33
 #[cfg(feature = "gateway")]
-pub(crate) fn write_tool_size(name: &str, desc: &str) -> usize {
-    // Must match write_tool's literals exactly:
-    //   {"name":"NAME","description":"ESC(DESC)","inputSchema":{"type":"object"}}
-    //   ^^^^^^^^^      ^^^^^^^^^^^^^^^^^         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    //   9              17                        33
-    9 + name.len() + 17 + esc_len(desc) + 33
-}
+pub(crate) const TOOL_JSON_OVERHEAD: usize = 9 + 17 + 33;
 
+/// Like `write_tool`, but treats `name` and `desc_raw` as already-escaped
+/// JSON-string content (the bytes between the surrounding `"`). The gateway
+/// uses this when echoing tool entries it received from a leaf — they're
+/// already valid JSON, so a decode-then-re-encode pass would just waste
+/// cycles and risk re-escaping a `\"` into `\\\"`.
 #[cfg(feature = "gateway")]
-fn esc_len(s: &str) -> usize {
-    // Mirror Writer::esc exactly: short escapes cost 2 bytes, long-form
-    // \u00XX escapes cost 6, plain bytes cost 1.
-    s.bytes()
-        .map(|b| match b {
-            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0C => 2,
-            0..=0x1F => 6,
-            _ => 1,
-        })
-        .sum()
+pub(crate) fn write_tool_raw(w: &mut Writer, name: &[u8], desc_raw: &[u8]) {
+    w.s(r#"{"name":""#).push(name)
+     .s(r#"","description":""#).push(desc_raw)
+     .s(r#"","inputSchema":{"type":"object"}}"#);
 }
 
 pub(crate) fn rpc_err(w: &mut Writer, id: &[u8], code: i32, msg: &str) {
@@ -520,19 +652,23 @@ pub mod transport {
     /// Drive one connection's read/write loop. Generic over any `Read + Write`
     /// stream so it serves Unix, TCP, TLS-wrapped, etc., transports identically.
     ///
+    /// `RX` / `TX` are the rx + tx buffer sizes in bytes. Defaults of 1024
+    /// each suit a typical MCP message; tune them down on RAM-constrained
+    /// devices (an 8 KiB-RAM part can run with `RX=256, TX=256`).
+    ///
     /// Static dispatch on `H: Fn` keeps the per-message call into the handler a
     /// direct call, not an indirect one — the loop is the hot path on a busy
-    /// gateway. `#[inline(never)]` keeps the 2 KB rx/tx buffers in this
-    /// function's frame instead of inlining them into every transport's
-    /// `serve()` accept loop.
+    /// gateway. `#[inline(never)]` keeps the rx/tx buffers in this function's
+    /// frame instead of inlining them into every transport's `serve()` accept
+    /// loop.
     #[inline(never)]
-    pub fn run_connection<C, H>(mut conn: C, handler: &H)
+    pub fn run_connection<const RX: usize, const TX: usize, C, H>(mut conn: C, handler: &H)
     where
         C: Read + Write,
         H: Fn(&[u8], &mut [u8]) -> usize + ?Sized,
     {
-        let mut rx = [0u8; 1024];
-        let mut tx = [0u8; 1024];
+        let mut rx = [0u8; RX];
+        let mut tx = [0u8; TX];
         let mut filled = 0usize;    // valid bytes in rx
         let mut msg_start = 0usize; // start of next unprocessed message
         'conn: loop {
@@ -582,14 +718,27 @@ pub mod transport {
     /// Unix socket transport. Serves one client at a time.
     /// I/O buffers are stack-allocated — no heap in the connection loop.
     ///
+    /// `RX` / `TX` size the read and write buffers in bytes (defaults 1024).
+    /// Drop them on RAM-tight devices: e.g. `UnixTransport::<256, 256>`.
+    ///
     /// The lifetime parameter lets callers pass any `&str` (env-var-derived
     /// `String`s, args, etc.) without leaking to `'static`.
-    pub struct UnixTransport<'a> {
+    pub struct UnixTransport<'a, const RX: usize = 1024, const TX: usize = 1024> {
         path: &'a str,
     }
 
-    impl<'a> UnixTransport<'a> {
+    // `new` is declared on the default-sized impl so call sites like
+    // `UnixTransport::new(path)` infer the const generics; users who want
+    // tuned sizes write `UnixTransport::<256, 256>::new_sized(path)` against
+    // the generic impl below.
+    impl<'a> UnixTransport<'a, 1024, 1024> {
         pub fn new(path: &'a str) -> Self {
+            Self::new_sized(path)
+        }
+    }
+
+    impl<'a, const RX: usize, const TX: usize> UnixTransport<'a, RX, TX> {
+        pub fn new_sized(path: &'a str) -> Self {
             let _ = std::fs::remove_file(path);
             Self { path }
         }
@@ -602,9 +751,8 @@ pub mod transport {
         /// ```
         pub fn serve(&self, handler: impl Fn(&[u8], &mut [u8]) -> usize) {
             let listener = UnixListener::bind(self.path).expect("bind failed");
-            eprintln!("listening on {}", self.path);
             for conn in listener.incoming().flatten() {
-                run_connection(conn, &handler);
+                run_connection::<RX, TX, _, _>(conn, &handler);
             }
         }
     }
@@ -613,18 +761,21 @@ pub mod transport {
     /// Use this for cross-machine setups (LAN, automotive Ethernet, etc.).
     /// For untrusted networks, layer TLS on top — see the `tls` feature
     /// (planned) or wrap your own `rustls` acceptor and call `run_connection`.
-    pub struct TcpTransport<'a> {
+    pub struct TcpTransport<'a, const RX: usize = 1024, const TX: usize = 1024> {
         addr: &'a str,
     }
 
-    impl<'a> TcpTransport<'a> {
-        pub fn new(addr: &'a str) -> Self { Self { addr } }
+    impl<'a> TcpTransport<'a, 1024, 1024> {
+        pub fn new(addr: &'a str) -> Self { Self::new_sized(addr) }
+    }
+
+    impl<'a, const RX: usize, const TX: usize> TcpTransport<'a, RX, TX> {
+        pub fn new_sized(addr: &'a str) -> Self { Self { addr } }
 
         pub fn serve(&self, handler: impl Fn(&[u8], &mut [u8]) -> usize) {
             let listener = TcpListener::bind(self.addr).expect("bind failed");
-            eprintln!("listening on {}", self.addr);
             for conn in listener.incoming().flatten() {
-                run_connection(conn, &handler);
+                run_connection::<RX, TX, _, _>(conn, &handler);
             }
         }
     }
@@ -642,7 +793,13 @@ pub mod transport {
     pub struct StdioTransport;
 
     impl StdioTransport {
+        /// Same defaults as the socket transports (1024 + 1024). For tiny
+        /// stdio servers, call `serve_sized::<RX, TX>` instead.
         pub fn serve(handler: impl Fn(&[u8], &mut [u8]) -> usize) {
+            Self::serve_sized::<1024, 1024>(handler);
+        }
+
+        pub fn serve_sized<const RX: usize, const TX: usize>(handler: impl Fn(&[u8], &mut [u8]) -> usize) {
             // Wrap stdin+stdout into a single Read+Write so the same
             // `run_connection` framing loop drives stdio identically to
             // sockets. Locks are acquired once here rather than per-syscall:
@@ -673,7 +830,61 @@ pub mod transport {
                 stdin: stdin.lock(),
                 stdout: stdout.lock(),
             };
-            run_connection(stream, &handler);
+            run_connection::<RX, TX, _, _>(stream, &handler);
+        }
+    }
+
+    /// UDP datagram transport. One datagram per request, one per reply.
+    /// Each request is handled inline; there's no concept of a connection,
+    /// so successive datagrams may come from different peers.
+    ///
+    /// Sized for short JSON-RPC messages: 1024-byte rx and tx buffers.
+    /// Datagrams larger than 1024 bytes are silently truncated by the
+    /// kernel — keep tool results well under that or use TCP/Unix instead.
+    ///
+    /// Reply datagrams are emitted exactly as the handler returns them.
+    /// `Runtime::handle` already trails responses with `\n`, which the
+    /// gateway's `UdpConnector` relies on for framing — see that type's
+    /// docs if you're writing a custom UDP handler.
+    ///
+    /// ```ignore
+    /// use mcp_edge::transport::UdpTransport;
+    /// UdpTransport::new("0.0.0.0:9000").serve(|m, o| rt.handle(m, o));
+    /// ```
+    #[cfg(feature = "udp")]
+    pub struct UdpTransport<'a, const RX: usize = 1024, const TX: usize = 1024> {
+        addr: &'a str,
+    }
+
+    #[cfg(feature = "udp")]
+    impl<'a> UdpTransport<'a, 1024, 1024> {
+        pub fn new(addr: &'a str) -> Self { Self::new_sized(addr) }
+    }
+
+    #[cfg(feature = "udp")]
+    impl<'a, const RX: usize, const TX: usize> UdpTransport<'a, RX, TX> {
+        pub fn new_sized(addr: &'a str) -> Self { Self { addr } }
+
+        pub fn serve(&self, handler: impl Fn(&[u8], &mut [u8]) -> usize) {
+            use std::net::UdpSocket;
+            let socket = UdpSocket::bind(self.addr).expect("bind failed");
+            let mut rx = [0u8; RX];
+            let mut tx = [0u8; TX];
+            loop {
+                // recv_from rather than recv — UDP is connectionless, so the
+                // peer address comes per-datagram. We reply to whoever asked.
+                let (n, src) = match socket.recv_from(&mut rx) {
+                    Ok(v) => v,
+                    Err(_) => continue, // transient errors don't kill the loop
+                };
+                if n == 0 { continue; }
+                let m = handler(&rx[..n], &mut tx);
+                if m > 0 {
+                    // Best-effort: a failed send_to (peer gone, ICMP
+                    // unreachable) shouldn't take down the server.
+                    let _ = socket.send_to(&tx[..m], src);
+                }
+            }
         }
     }
 }
@@ -685,7 +896,7 @@ pub mod transport {
 #[cfg(feature = "gateway")]
 pub mod gateway;
 #[cfg(feature = "gateway")]
-pub use gateway::Gateway;
+pub use gateway::{DynamicGateway, Gateway};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -844,6 +1055,52 @@ mod tests {
         assert!(s.contains(r#""id":null"#), "{s}");
         assert!(s.contains("-32700"), "{s}");
         assert!(s.contains("parse error"), "{s}");
+    }
+
+    #[test]
+    fn test_notification_drops_response() {
+        // JSON-RPC 2.0: a request with no `id` field is a notification —
+        // server MUST NOT respond. mcp-edge has no notification side effects,
+        // so we drop the message silently.
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 256];
+        let n = rt.handle(
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &mut out,
+        );
+        assert_eq!(n, 0, "notifications must produce no response");
+    }
+
+    #[test]
+    fn test_explicit_null_id_is_request_not_notification() {
+        // `"id": null` is a legal request id — distinct from `id` being
+        // absent. The server MUST respond, echoing the null id.
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 512];
+        let n = rt.handle(
+            br#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#,
+            &mut out,
+        );
+        assert!(n > 0, "explicit id:null is a request, not a notification");
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.contains(r#""id":null"#), "{s}");
+        assert!(s.contains("tools"), "{s}");
+    }
+
+    #[test]
+    fn test_notification_with_unknown_method_is_dropped() {
+        // Unknown-method on a request returns -32601, but on a notification
+        // it must still produce no response — `id` absence dominates.
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+        let mut out = [0u8; 256];
+        let n = rt.handle(br#"{"jsonrpc":"2.0","method":"foo/bar"}"#, &mut out);
+        assert_eq!(n, 0, "unknown method on a notification must still be silent");
     }
 
     #[test]
