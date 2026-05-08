@@ -301,6 +301,7 @@ Three tests determine whether the architecture is sound. Run before building any
 ## Risks
 
 - **CC `-p` quality.** May not be useful enough for non-trivial tasks. Mitigation: test in Phase 0; if it fails, design an iteration loop where the agent self-evaluates and continues.
+- **Mid-task input behavior is in flux.** Today CC silently queues typed input during a busy turn (multiple GitHub issues track the docs/behavior mismatch and request explicit queue-mode toggles). It may switch to interrupt-by-default, gain a Shift+Enter modifier, or stay as-is. Mitigation: design the skill to work in both modes — the offload payload is consistent whether captured at a clean turn boundary (queue mode) or at an interruption point (interrupt mode), since `session.jsonl` is self-consistent in both cases.
 - **Project-hash routing.** Session paths may not transfer cleanly cross-machine. Mitigation: compute hash inside agent.py; if format changes, abstract behind a helper.
 - **AgentCore preview APIs.** Will change during build. Mitigation: pin SDK version; budget for one migration during dev.
 - **Vendor preemption.** Anthropic may ship native local→web push, undercutting the casual-user pitch. Mitigation: lean into the AWS-native enterprise angle that vendor solutions can't easily match.
