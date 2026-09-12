@@ -36,6 +36,10 @@ name = "wrap"
 required-features = ["std"]
 
 [[example]]
+name = "client"
+required-features = ["std"]
+
+[[example]]
 name = "gateway"
 required-features = ["gateway"]
 

@@ -1,6 +1,6 @@
 # mcp-edge examples
 
-Four runnable examples, each covering one usage shape.
+Five runnable examples, each covering one usage shape, plus a benchmark.
 
 > **First-time question:** *"I already have a sensor outputting humidity (or whatever). Does mcp-edge wrap it, or do I rewrite my sensor?"*
 >
@@ -94,4 +94,34 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | nc -U /tmp/gateway.sock
 ```
 
-Override leaf paths with the `LEAF1`, `LEAF2` env vars. See [`gateway.rs`](gateway.rs) for the source.
+Three seconds after start it also tries `/tmp/leaf3.sock`; bring up `TOOL=pressure SOCK=/tmp/leaf3.sock cargo run --example sensor` beforehand and every connected client receives a `notifications/tools/list_changed` push. Override paths with the `LEAF1`, `LEAF2`, `LEAF3`, and `SOCK` env vars. See [`gateway.rs`](gateway.rs) for the source.
+
+## client — the consuming side
+
+Connects to any mcp-edge server or gateway, runs the handshake, lists what it found, and calls a tool. Dependency-free, and the shape to crib if you are writing your own client.
+
+```bash
+cargo run --example sensor &
+cargo run --example client
+# connecting to /tmp/mcp-edge.sock
+# initialize -> {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",...}}
+# tools/list -> 2 tool(s): temp_read, humidity_read
+# calling temp_read with {}
+# tools/call -> {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"22.5"}]}}
+```
+
+Arguments are `[address] [tool] [args-json]`, with `--watch` to hold the connection open and print `tools/list_changed` pushes from a `DynamicGateway`:
+
+```bash
+cargo run --example client -- /tmp/gateway.sock humidity_read '{}'
+cargo run --example client -- tcp://10.0.0.5:9000
+cargo run --example client -- /tmp/gateway.sock --watch
+```
+
+## bench — throughput and latency
+
+Not a usage shape, a measurement harness: runtime dispatch, static vs dynamic gateway `handle`, full proxy round-trips over a real socket, mutation rate, and broadcast fan-out. Zero deps, hand-rolled percentiles.
+
+```bash
+cargo run --profile bench-fast --example bench --features gateway
+```
