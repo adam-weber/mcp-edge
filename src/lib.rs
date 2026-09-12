@@ -371,7 +371,10 @@ pub(crate) const TOOLS_LIST_CHANGED_NOTIFY: &[u8] =
     b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n";
 
 pub(crate) fn write_tool(w: &mut Writer, name: &str, desc: &str) {
-    w.s(r#"{"name":""#).s(name)
+    // Escape the name as well as the description. Names are `'static` and
+    // developer-supplied, so this is defence in depth rather than a live
+    // hole, but an unescaped `"` in a name would emit invalid JSON.
+    w.s(r#"{"name":""#).esc(name)
      .s(r#"","description":""#).esc(desc)
      .s(r#"","inputSchema":{"type":"object"}}"#);
 }
@@ -411,6 +414,9 @@ pub(crate) fn rpc_err(w: &mut Writer, id: &[u8], code: i32, msg: &str) {
 // Returns the raw bytes of the value (including delimiters for objects/arrays).
 // ---------------------------------------------------------------------------
 
+// Only the gateway extracts arbitrary keys; the runtime's hot paths use
+// `walk_obj_for`. Gated so `--no-default-features` builds stay warning-free.
+#[cfg(any(feature = "gateway", test))]
 #[inline]
 pub(crate) fn obj_get<'a>(obj: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     let mut p = sp(obj, 0);
@@ -454,9 +460,17 @@ fn skip_val(b: &[u8], p: &mut usize) -> Option<()> {
         b'"' => { *p += 1; eat_str(b, p) }
         b'{' => skip_delimited(b, p, b'{', b'}'),
         b'[' => skip_delimited(b, p, b'[', b']'),
-        b't' => { *p += 4; Some(()) }
-        b'f' => { *p += 5; Some(()) }
-        b'n' => { *p += 4; Some(()) }
+        // Literals must be matched in full, not skipped by length. A blind
+        // `*p += 4` walks the cursor past the end of a buffer that ends
+        // mid-literal (`{"id":t`), and the caller then slices `obj[v0..v1]`
+        // out of range. Every inbound message reaches here through
+        // `classify`, so that was a remote panic, and `panic = "abort"`
+        // turns a panic into a dead process. Matching the bytes also stops
+        // garbage like `txx` being accepted as a value and echoed back into
+        // a response as invalid JSON.
+        b't' => lit(b, p, b"true"),
+        b'f' => lit(b, p, b"false"),
+        b'n' => lit(b, p, b"null"),
         b'-' | b'0'..=b'9' => {
             while *p < b.len() && matches!(b[*p], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
                 *p += 1;
@@ -464,6 +478,17 @@ fn skip_val(b: &[u8], p: &mut usize) -> Option<()> {
             Some(())
         }
         _ => None,
+    }
+}
+
+// Match one JSON literal exactly, advancing past it. `*p < b.len()` on entry.
+#[inline]
+fn lit(b: &[u8], p: &mut usize, word: &[u8]) -> Option<()> {
+    if b.len() - *p >= word.len() && &b[*p..*p + word.len()] == word {
+        *p += word.len();
+        Some(())
+    } else {
+        None
     }
 }
 
@@ -667,51 +692,38 @@ pub mod transport {
         C: Read + Write,
         H: Fn(&[u8], &mut [u8]) -> usize + ?Sized,
     {
-        let mut rx = [0u8; RX];
-        let mut tx = [0u8; TX];
-        let mut filled = 0usize;    // valid bytes in rx
-        let mut msg_start = 0usize; // start of next unprocessed message
-        'conn: loop {
-            // Bulk read — one syscall for potentially many bytes.
-            let n = match conn.read(&mut rx[filled..]) {
+        let mut framer: crate::Framer<RX, TX> = crate::Framer::new();
+        loop {
+            // Read straight into the framer's buffer: one syscall, no copy.
+            let n = match conn.read(framer.rx_space()) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            filled += n;
-            // Process every complete (newline-terminated) message in the buffer.
-            loop {
-                match rx[msg_start..filled].iter().position(|&b| b == b'\n') {
-                    None => break,
-                    Some(rel) => {
-                        let msg_end = msg_start + rel;
-                        if msg_end > msg_start {
-                            let n = handler(&rx[msg_start..msg_end], &mut tx);
-                            if n > 0 {
-                                if conn.write_all(&tx[..n]).is_err() { break 'conn; }
-                                // Flush is a no-op on socket streams but
-                                // required for buffered streams like stdout:
-                                // when this process is spawned with a pipe
-                                // (the typical subprocess-MCP-server setup),
-                                // stdout is fully-buffered by default and
-                                // unflushed responses sit invisible.
-                                if conn.flush().is_err() { break 'conn; }
-                            }
-                        }
-                        msg_start = msg_end + 1;
+            let mut io_err = false;
+            let framed = framer.commit(
+                n,
+                |msg, out| handler(msg, out),
+                |resp| {
+                    if conn.write_all(resp).is_err() {
+                        io_err = true;
+                        return;
                     }
-                }
+                    // Flush is a no-op on socket streams but required for
+                    // buffered ones like stdout: when this process is spawned
+                    // with a pipe (the typical subprocess-MCP-server setup),
+                    // stdout is fully-buffered and unflushed responses sit
+                    // invisible.
+                    if conn.flush().is_err() {
+                        io_err = true;
+                    }
+                },
+            );
+            // An oversized frame closes the connection here rather than using
+            // the framer's resync: on a stream there is a peer to disconnect,
+            // and a silent recovery would hide a misconfigured RX from them.
+            if io_err || framed.is_err() {
+                break;
             }
-            // Compact: slide unconsumed bytes to the front.
-            if msg_start > 0 {
-                rx.copy_within(msg_start..filled, 0);
-                filled -= msg_start;
-                msg_start = 0;
-            }
-            // Oversized message (> rx.len() with no newline): close the
-            // connection. Resetting `filled` would re-interpret the tail of
-            // the dropped message as a fresh request and parse garbage —
-            // closing makes the failure visible to the client.
-            if filled == rx.len() { break 'conn; }
         }
     }
 
@@ -888,6 +900,13 @@ pub mod transport {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Framing — no_std core, shared by every transport
+// ---------------------------------------------------------------------------
+
+pub mod frame;
+pub use frame::{FrameError, Framer};
 
 // ---------------------------------------------------------------------------
 // Gateway — feature-gated
@@ -1182,5 +1201,91 @@ mod tests {
         let json = br#"{"trap":"\"target\":fake","target":"real"}"#;
         let val = obj_get(json, b"target").unwrap();
         assert_eq!(val, br#""real""#);
+    }
+
+    #[test]
+    fn fuzz_handle_never_panics_on_untrusted_input() {
+        static S: Stub = Stub;
+        let mut rt: Runtime<'_, 1> = Runtime::new();
+        rt.register(&S).unwrap();
+
+        // xorshift: deterministic, no dev-dependency.
+        let mut st: u64 = 0x243F6A8885A308D3;
+        let mut rnd = move || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+
+        // Alphabet biased toward JSON structure so we hit parser states.
+        let alpha: &[u8] = b"{}[]\":,0123456789tfnaeul \\\n\t\x00\xff-+.eE";
+        let seeds: &[&[u8]] = &[
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"temp_read","arguments":{}}}"#,
+            br#"{"id":null,"method":"tools/list"}"#,
+            br#"{"id":"x","method":"initialize"}"#,
+        ];
+
+        let mut panics = 0usize;
+        let mut buf = [0u8; 512];
+
+        // 1. Pure random bytes.
+        for _ in 0..40_000 {
+            let len = (rnd() % 96) as usize;
+            let input: Vec<u8> = (0..len).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect();
+            let mut out = [0u8; 512];
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { rt.handle(&input, &mut out); })).is_err() {
+                panics += 1;
+                if panics < 4 { println!("PANIC(random): {:?}", String::from_utf8_lossy(&input)); }
+            }
+        }
+
+        // 2. Truncations of every prefix of valid messages.
+        for seed in seeds {
+            for cut in 0..seed.len() {
+                let mut out = [0u8; 512];
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { rt.handle(&seed[..cut], &mut out); })).is_err() {
+                    panics += 1;
+                    println!("PANIC(truncate@{cut}): {:?}", String::from_utf8_lossy(&seed[..cut]));
+                }
+            }
+        }
+
+        // 3. Single-byte mutations of valid messages.
+        for seed in seeds {
+            for pos in 0..seed.len() {
+                for &b in alpha {
+                    let mut m = seed.to_vec();
+                    m[pos] = b;
+                    let mut out = [0u8; 512];
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { rt.handle(&m, &mut out); })).is_err() {
+                        panics += 1;
+                        if panics < 8 { println!("PANIC(mutate): {:?}", String::from_utf8_lossy(&m)); }
+                    }
+                }
+            }
+        }
+
+        // 4. Pathological nesting (stack-overflow check).
+        for depth in [64usize, 1000, 10_000] {
+            let mut deep = Vec::from(&b"{\"id\":1,\"method\":\"tools/list\",\"params\":"[..]);
+            deep.extend(std::iter::repeat_n(b'[', depth));
+            deep.extend(std::iter::repeat_n(b']', depth));
+            deep.push(b'}');
+            let mut out = [0u8; 512];
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { rt.handle(&deep, &mut out); })).is_err() {
+                panics += 1;
+                println!("PANIC(nesting depth {depth})");
+            }
+        }
+
+        // 5. Tiny output buffers against valid input (truncation path).
+        for cap in 1..80usize {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.handle(seeds[0], &mut buf[..cap])
+            }));
+            match r {
+                Ok(n) => assert!(n == 0 || n <= cap, "wrote {n} into {cap}"),
+                Err(_) => { panics += 1; println!("PANIC(out cap {cap})"); }
+            }
+        }
+
+        println!("total panics: {panics}");
+        assert_eq!(panics, 0, "handle() must never panic on untrusted input");
     }
 }

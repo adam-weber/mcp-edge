@@ -405,6 +405,22 @@ impl<const L: usize, const T: usize, const B: usize, const A: usize> GatewayInne
     fn add_route(&mut self, name: &[u8], desc: &[u8], leaf: u8) -> Result<(), &'static str> {
         if name.is_empty() { return Err("tool name is empty"); }
         if name.len() > NAME_MAX { return Err("tool name exceeds NAME_MAX bytes"); }
+        // Names and descriptions arrive from a leaf, which is an untrusted
+        // device on a bus or a network. They are re-emitted verbatim into
+        // tools/list, so a non-UTF-8 byte would make the whole response
+        // invalid JSON for every client and every tool, not just this entry.
+        if core::str::from_utf8(name).is_err() {
+            return Err("tool name is not valid UTF-8");
+        }
+        if core::str::from_utf8(desc).is_err() {
+            return Err("tool description is not valid UTF-8");
+        }
+        // Reject rather than truncate. Cutting at 255 bytes can land mid
+        // escape sequence, leaving a trailing `\` that escapes the closing
+        // quote and corrupts the entire tools-list JSON.
+        if desc.len() > u8::MAX as usize {
+            return Err("tool description exceeds 255 bytes");
+        }
         if self.routes[..self.route_count as usize]
             .iter()
             .any(|r| !r.is_empty() && self.route_name(r) == name)
@@ -431,9 +447,8 @@ impl<const L: usize, const T: usize, const B: usize, const A: usize> GatewayInne
         let desc_off = self.arena_push(desc)?;
         #[allow(clippy::cast_possible_truncation)]
         let name_len = name.len() as u8;
-        let desc_len_capped = desc.len().min(u8::MAX as usize);
         #[allow(clippy::cast_possible_truncation)]
-        let desc_len = desc_len_capped as u8;
+        let desc_len = desc.len() as u8;
         self.routes[slot] = RouteIdx {
             name_off, name_len, desc_off, desc_len, leaf,
         };
@@ -558,6 +573,19 @@ impl<const L: usize, const T: usize, const B: usize, const A: usize> GatewayInne
         })();
 
         if result.is_err() {
+            // Restoring the counters is not enough. When this attempt reused a
+            // slot freed by an earlier `remove_leaf`, that slot sits *below*
+            // the high-water mark, so the stale entry stays visible and its
+            // arena offsets now point at bytes the next `add_leaf` will
+            // overwrite. That surfaced as phantom tools in `tools/list` and,
+            // via `leaf_addr`'s `from_utf8_unchecked`, as undefined behaviour.
+            // Clear what we wrote before rewinding the counters.
+            self.leaves[leaf_slot] = LeafIdx::EMPTY;
+            for r in self.routes.iter_mut() {
+                if !r.is_empty() && r.leaf == leaf_idx {
+                    *r = RouteIdx::EMPTY;
+                }
+            }
             self.arena_used = snapshot.0;
             self.leaf_count = snapshot.1;
             self.route_count = snapshot.2;
@@ -1215,44 +1243,31 @@ fn run_gateway_connection<
     const A: usize,
     S: Read,
 >(mut conn: S, gw: &DynamicGateway<L, T, B, C, A>, sub: &Subscriber) {
-    let mut rx = [0u8; 1024];
-    let mut tx = [0u8; 1024];
-    let mut filled = 0usize;
-    let mut msg_start = 0usize;
-    'conn: loop {
-        let n = match conn.read(&mut rx[filled..]) {
+    let mut framer: crate::Framer<1024, 1024> = crate::Framer::new();
+    loop {
+        let n = match conn.read(framer.rx_space()) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        filled += n;
-        loop {
-            match rx[msg_start..filled].iter().position(|&b| b == b'\n') {
-                None => break,
-                Some(rel) => {
-                    let msg_end = msg_start + rel;
-                    if msg_end > msg_start {
-                        let m = gw.handle(&rx[msg_start..msg_end], &mut tx);
-                        if m > 0 {
-                            // Hold sub.writer for the entire response so a
-                            // racing broadcast can't splice its bytes in.
-                            let mut w = match sub.writer.lock() {
-                                Ok(w) => w,
-                                Err(p) => p.into_inner(),
-                            };
-                            if w.write_all(&tx[..m]).is_err() { break 'conn; }
-                            if w.flush().is_err() { break 'conn; }
-                        }
-                    }
-                    msg_start = msg_end + 1;
+        let mut io_err = false;
+        let framed = framer.commit(
+            n,
+            |msg, out| gw.handle(msg, out),
+            |resp| {
+                // Hold sub.writer for the whole response so a racing
+                // broadcast can't splice its bytes into our frame.
+                let mut w = match sub.writer.lock() {
+                    Ok(w) => w,
+                    Err(p) => p.into_inner(),
+                };
+                if w.write_all(resp).is_err() || w.flush().is_err() {
+                    io_err = true;
                 }
-            }
+            },
+        );
+        if io_err || framed.is_err() {
+            break;
         }
-        if msg_start > 0 {
-            rx.copy_within(msg_start..filled, 0);
-            filled -= msg_start;
-            msg_start = 0;
-        }
-        if filled == rx.len() { break 'conn; }
     }
 }
 
@@ -1675,5 +1690,112 @@ mod tests {
             0,
             "concurrent reads must always see well-formed JSON"
         );
+    }
+
+    #[test]
+    fn fuzz_leaf_responses_never_panic_or_corrupt() {
+        // A leaf is an untrusted device on a bus or a network. Everything it
+        // returns is parsed by commit_leaf and echoed into tools/list.
+        let mut st: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = move || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let alpha: &[u8] = b"{}[]\":,namedscriptio0123456789tfnul \\\n\x00\xff";
+
+        let seed = br#"[{"name":"t1","description":"d"},{"name":"t2","description":"d2"}]"#;
+        let mut panics = 0usize;
+
+        let run = |arr: &[u8], label: &str, panics: &mut usize| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut gw: Gateway<2, 8, 512> = Gateway::new();
+                let _ = gw.inner.commit_leaf("leaf", arr);
+                // Whatever survived must still serialize as well-formed JSON.
+                let mut out = [0u8; 1024];
+                let n = gw.handle(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &mut out);
+                if n > 0 {
+                    let s = core::str::from_utf8(&out[..n]).unwrap_or("");
+                    assert!(s.ends_with("]}}\n"), "malformed tools/list: {s}");
+                }
+            }));
+            if r.is_err() {
+                *panics += 1;
+                if *panics < 5 { println!("PANIC({label}): {:?}", String::from_utf8_lossy(arr)); }
+            }
+        };
+
+        for _ in 0..30_000 {
+            let len = (rnd() % 80) as usize;
+            let arr: Vec<u8> = (0..len).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect();
+            run(&arr, "random", &mut panics);
+        }
+        for cut in 0..seed.len() { run(&seed[..cut], "truncate", &mut panics); }
+        for pos in 0..seed.len() {
+            for &b in alpha {
+                let mut m = seed.to_vec();
+                m[pos] = b;
+                run(&m, "mutate", &mut panics);
+            }
+        }
+        // Hostile shapes aimed at the JSON writer specifically.
+        let hostile: &[&[u8]] = &[
+            br#"[{"name":"a\"","description":"d"}]"#,
+            br#"[{"name":"a","description":"d\""}]"#,
+            br#"[{"name":"a","description":"\\"}]"#,
+            br#"[{"name":"","description":"d"}]"#,
+            br#"[{"description":"no name"}]"#,
+            br#"[{"name":"a"},{"name":"a"}]"#,
+        ];
+        for h in hostile { run(h, "hostile", &mut panics); }
+
+        // A long description: the 255-byte cap cutting mid-escape.
+        let mut long = Vec::from(&b"[{\"name\":\"a\",\"description\":\""[..]);
+        long.extend(std::iter::repeat_n(b'x', 254));
+        long.extend_from_slice(b"\\n");
+        long.extend_from_slice(b"\"}]");
+        run(&long, "long-desc", &mut panics);
+
+        println!("total panics: {panics}");
+        assert_eq!(panics, 0, "leaf responses must never panic or emit malformed JSON");
+    }
+
+    #[test]
+    fn failed_add_after_remove_leaves_no_phantom_entries() {
+        // Regression: rollback restored the counters but not the slot
+        // contents. A reused slot sits below the high-water mark, so the
+        // stale leaf and its routes stayed live, pointing at arena bytes the
+        // next add_leaf overwrote. Symptoms were duplicate/garbage tools in
+        // tools/list and a `leaf_addr` resolving to a leaf never added.
+        let mut gw: Gateway<2, 4, 1024> = Gateway::new();
+        gw.inner.commit_leaf("leaf-a", br#"[{"name":"a1","description":""}]"#).unwrap();
+        gw.inner.remove_leaf_inner("leaf-a").unwrap();
+
+        // Fails partway: the second tool duplicates the first.
+        let r = gw.inner.commit_leaf(
+            "leaf-b",
+            br#"[{"name":"b1","description":""},{"name":"b1","description":""}]"#,
+        );
+        assert!(r.is_err(), "duplicate within one leaf must fail");
+        assert_eq!(gw.inner.leaves[0].len, 0, "failed add must not leave a leaf slot claimed");
+        assert!(gw.inner.routes[0].is_empty(), "failed add must not leave a route behind");
+
+        // A later add must not inherit the failed attempt's ghosts.
+        gw.inner.commit_leaf("leaf-c", br#"[{"name":"c1","description":""}]"#).unwrap();
+        let mut out = [0u8; 512];
+        let n = gw.handle(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert_eq!(s.matches(r#""name":"c1""#).count(), 1, "exactly one c1: {s}");
+        assert!(!s.contains("b1"), "rolled-back route must not appear: {s}");
+    }
+
+    #[test]
+    fn leaf_supplied_junk_is_rejected_not_re_emitted() {
+        let mut gw: Gateway<2, 4, 1024> = Gateway::new();
+        // Non-UTF-8 in a name or description would corrupt the whole response.
+        assert!(gw.inner.add_route(b"a\xffb", b"d", 0).is_err(), "non-UTF-8 name");
+        assert!(gw.inner.add_route(b"ab", b"d\xff", 0).is_err(), "non-UTF-8 description");
+        // Over-long descriptions are rejected, not cut mid-escape.
+        let long = vec![b'x'; 256];
+        assert!(gw.inner.add_route(b"ab", &long, 0).is_err(), "256-byte description");
+        // The boundary case still works.
+        let ok = vec![b'x'; 255];
+        assert!(gw.inner.add_route(b"ab", &ok, 0).is_ok(), "255 bytes is the limit, not an error");
     }
 }

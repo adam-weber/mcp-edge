@@ -234,12 +234,66 @@ Gateway<L, T, B, C, A>
 
 [`examples/gateway.rs`](examples/gateway.rs) is a runnable demo: two leaves at startup, a third added three seconds in, with the push arriving on an already-connected client. [`tests/dynamic.rs`](tests/dynamic.rs) is the same flow as an end-to-end assertion.
 
+## Running on a microcontroller
+
+The core is `no_std` with no allocator, so it builds for bare metal as-is. Verified building clean (warning-free) for:
+
+| Target | Boards |
+|---|---|
+| `thumbv7em-none-eabihf` | Arduino Uno R4 (RA4M1), Nano 33 BLE (nRF52840) |
+| `thumbv6m-none-eabi` | Arduino Nano RP2040 Connect |
+| `riscv32imc-unknown-none-elf` | ESP32-C3 class |
+
+Measured on Cortex-M4, for a one-tool server including framing: **3,862 bytes of flash**, 4 bytes of RAM per provider slot, and whatever you size the buffers to. That leaves room on parts where the vendor SDK alone would not fit.
+
+### Framing without an OS
+
+There is no `std::io` on these targets. Bare-metal triples ship `core` and `alloc` only, so there is no `Read`/`Write` to implement against and no sockets to accept. `Framer` inverts the relationship instead: you own the peripheral, and push bytes in as they arrive.
+
+```rust
+use mcp_edge::{Framer, Runtime};
+
+let mut rt: Runtime<'_, 2, 64> = Runtime::new();
+rt.register(&sensor).unwrap();
+
+// RX caps one inbound message, TX one outbound response.
+let mut framer: Framer<256, 256> = Framer::new();
+
+loop {
+    let byte = uart.read_byte();
+    framer.feed(
+        &[byte],
+        |msg, out| rt.handle(msg, out),
+        |resp| uart.write_all(resp),
+    ).ok();
+}
+```
+
+`feed` takes any chunk size, so a UART interrupt handing over one byte and a USB-CDC endpoint handing over 64 both work. Where you'd rather not pay for the copy, `framer.rx_space()` hands you the unfilled tail of the buffer to read or DMA into directly, and `framer.commit(n, ..)` dispatches what that completed. The `std` transports in this crate are thin adapters over exactly that pair, so socket and UART paths share one framing implementation rather than two.
+
+A message longer than `RX` is dropped and the framer resynchronizes on the next newline, so a truncated frame is never parsed as a fresh request. It reports `FrameError::Overflow` once, not on every subsequent byte.
+
+### Sizing it for the part
+
+Everything is a const generic, so RAM is a number you choose rather than one you discover:
+
+- `Runtime<'_, N, OUT>`: `N` pointer-sized slots resident, `OUT` bytes of stack on the `tools/call` path only.
+- `Framer<RX, TX>`: exactly `RX + TX` bytes plus two words.
+
+A 64 KB-SRAM part runs the defaults comfortably. On something tighter, `Runtime<'_, 2, 64>` plus `Framer<256, 256>` is 584 bytes of buffers total.
+
+### What still needs writing
+
+The crate gives you framing and protocol, not board support. Wiring `uart.read_byte()` to your HAL is yours, and it is the loop above rather than anything larger.
+
+Two caveats worth knowing before you pick a board. Classic 8-bit AVR (Uno, Nano, ATmega328P) is a poor fit: Rust's AVR target is nightly-only tier 3 with known codegen bugs, and 2 KB of SRAM is tight once buffers are accounted for. And `core::fmt`'s float formatting is expensive on small parts, so prefer integer math in `Provider::call` (`write!(out, "{}.{}", c / 100, c % 100 / 10)`) over `{:.1}` on an `f32`.
+
 ## Architecture
 
 Three trait-shaped boundaries; nothing else is load-bearing.
 
 - **`Provider`**: what the device exposes. Backed by whatever you can reach, including GPIO, I2C, CAN, LIN, UDS, and software state.
-- **`Transport`**: how agents reach you. `UnixTransport`, `TcpTransport`, `StdioTransport`, and `UdpTransport` today. TLS and `embedded-nal` (for bare-metal MCUs) layer on as features or sibling crates.
+- **`Transport`**: how agents reach you. `UnixTransport`, `TcpTransport`, `StdioTransport`, and `UdpTransport` under `std`; on bare metal, `Framer` gives you the same framing with the peripheral left in your hands. TLS layers on as a feature.
 - **`Connector`**: how a gateway reaches each leaf. `UnixConnector`, `TcpConnector`, `UdpConnector`, and the URL-scheme-dispatching `MultiConnector` today. Future: `TlsConnector`, SOME/IP-SD for automotive zonal controllers.
 
 Default connectors and transports are zero-sized. Heavyweight integrations live behind feature flags so they cost nothing if you don't opt in.
@@ -259,7 +313,7 @@ Default connectors and transports are zero-sized. Heavyweight integrations live 
 
 ## Features
 
-- `std` (default): `UnixTransport`, `TcpTransport`, `StdioTransport`
+- `std` (default): `UnixTransport`, `TcpTransport`, `StdioTransport`. Without it you still get `Runtime`, `Provider`, and `Framer`, which is the whole bare-metal surface.
 - `gateway`: `Gateway` and `DynamicGateway` for aggregating leaves (requires `std`)
 - `udp`: `UdpTransport` and `UdpConnector` (datagram framing, one request to one reply)
 - `tls`: reserves the `tls://` URL scheme in `MultiConnector` (rustls integration lands in a follow-up)
